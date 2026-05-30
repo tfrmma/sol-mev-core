@@ -12,7 +12,7 @@ mod strategies;
 use anyhow::Result;
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
@@ -23,12 +23,15 @@ use crate::{
     risk::RiskEngine,
     simulator::{AccountCache, RpcSimulator, Simulator},
     smart_money::SmartMoneyClassifier,
+    state::{CURRENT_SLOT, OBLIGATIONS, POOLS, GC_SLOT_THRESHOLD},
     strategies::{StrategyEngine, TradingSignal},
 };
 
 const OPP_CHAN: usize        = 512;
 const SIGNAL_CHAN: usize     = 128;
-const REGISTRY_TTL: Duration = Duration::from_secs(300); // 5min refresh. slow enough to not hammer disk.
+const REGISTRY_TTL: Duration = Duration::from_secs(300);
+// GC runs every 30s. at 400ms/slot that's ~75 slots between sweeps — plenty of headroom.
+const GC_INTERVAL: Duration  = Duration::from_secs(30);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -45,8 +48,10 @@ async fn main() -> Result<()> {
     let signer    = config.load_keypair()?;
     let signer_pk = signer.try_pubkey()?;
 
-    info!("signer={signer_pk} rpc={} arb={} liq={} sandwich={}",
-          config.rpc_url, config.enable_arbitrage, config.enable_liquidation, config.enable_sandwich);
+    let spam_eps = config.spam_endpoints();
+    info!("signer={signer_pk} rpc={} arb={} liq={} sandwich={} spam_rpcs={}",
+          config.rpc_url, config.enable_arbitrage, config.enable_liquidation,
+          config.enable_sandwich, spam_eps.len());
 
     let registry = Registry::load(Path::new("registry.json"))?;
     let risk     = RiskEngine::new();
@@ -59,11 +64,11 @@ async fn main() -> Result<()> {
         let pool_keys = registry.active_program_ids();
         match rpc_sim.warm_cache(&pool_keys, &cache).await {
             Ok(n)  => info!("cache warm: {n} accounts"),
-            Err(e) => tracing::warn!("partial cache warm: {e:#}"), // non-fatal, local sim will miss and fall back
+            Err(e) => warn!("partial cache warm: {e:#}"), // non-fatal, sim will fall back to RPC on miss
         }
     }
 
-    let simulator = Arc::new(Simulator::new(&config.rpc_url, cache.clone()));
+    let simulator = Arc::new(Simulator::new(&config.rpc_url, cache.clone(), spam_eps));
     let (opp_tx, opp_rx)     = mpsc::channel::<Opportunity>(OPP_CHAN);
     let (sig_tx, mut sig_rx) = mpsc::channel::<TradingSignal>(SIGNAL_CHAN);
 
@@ -94,7 +99,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    // executor: signal → jito bundle
+    // executor: signal → jito bundle (+ rpc spam if configured)
     {
         let (cfg, sim) = (config.clone(), simulator.clone());
         tokio::spawn(async move {
@@ -106,19 +111,43 @@ async fn main() -> Result<()> {
         });
     }
 
-    // registry heartbeat — just logs pool count for now. add reload logic here if needed.
+    // GC task: evicts dead pools and stale obligations from the sharded tables.
+    // without this, pump.fun launches bloat POOLS to tens of thousands of dead entries
+    // within hours. latency degrades, hash collisions creep up. just run the sweep.
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(GC_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let slot          = CURRENT_SLOT.load(std::sync::atomic::Ordering::Relaxed);
+            let pools_before  = POOLS.len();
+            let obligs_before = OBLIGATIONS.len();
+
+            let pools_evicted  = POOLS.gc_stale(slot, GC_SLOT_THRESHOLD);
+            let obligs_evicted = OBLIGATIONS.gc_stale(slot, GC_SLOT_THRESHOLD);
+
+            if pools_evicted > 0 || obligs_evicted > 0 {
+                info!(
+                    "gc: slot={slot} pools {pools_before}→{} (-{pools_evicted}) \
+                     obligations {obligs_before}→{} (-{obligs_evicted})",
+                    POOLS.len(), OBLIGATIONS.len()
+                );
+            }
+        }
+    });
+
+    // registry heartbeat
     {
         let reg = registry.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(REGISTRY_TTL);
             loop {
                 ticker.tick().await;
-                info!("registry: {} pools active", reg.pool_count());
+                info!("registry: {} pools", reg.pool_count());
             }
         });
     }
 
-    // diagnostics: top smart money wallets + highest vol asset every minute
+    // diagnostics: top smart money wallets + highest vol asset, every minute
     {
         let (risk, sm) = (risk.clone(), sm.clone());
         tokio::spawn(async move {
