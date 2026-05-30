@@ -57,12 +57,26 @@ pub struct BotConfig {
     // always true in prod. if you set this to false and blow up your wallet, that's on you.
     #[arg(long, env = "SIMULATE", default_value_t = true)]
     pub simulate_before_send: bool,
+
+    // comma-separated list of backup RPC endpoints for parallel tx spam alongside jito bundles.
+    // e.g. "https://rpc1.example.com,https://rpc2.example.com"
+    // leave empty to skip spam (jito-only). more endpoints = better inclusion odds at peak load.
+    #[arg(long, env = "SPAM_RPC_ENDPOINTS", default_value = "")]
+    pub spam_rpc_endpoints: String,
 }
 
 impl BotConfig {
     pub fn from_env() -> Result<Self> {
         let _ = dotenvy::dotenv(); // best-effort. missing .env is fine if env vars are set directly.
         Ok(Self::parse())
+    }
+
+    pub fn spam_endpoints(&self) -> Vec<String> {
+        self.spam_rpc_endpoints.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect()
     }
 
     pub fn load_keypair(&self) -> Result<Keypair> {
