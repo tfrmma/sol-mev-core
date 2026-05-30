@@ -39,7 +39,10 @@ pub struct Executor {
 impl Executor {
     pub fn new(config: BotConfig, signer: Keypair, simulator: Arc<Simulator>) -> Self {
         let rpc  = RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
-        let jito = JitoClient::new(&config.jito_url, config.max_retries);
+        // wire spam endpoints from simulator into jito client.
+        // executor owns the jito client so this is the natural place to plumb them together.
+        let jito = JitoClient::new(&config.jito_url, config.max_retries)
+            .with_spam_endpoints(simulator.spam_endpoints.clone());
         Self { rpc, jito, simulator, signer, config }
     }
 
