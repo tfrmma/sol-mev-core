@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 # ── async ──────────────────────────────────────────────────────────────────────
 [dependencies]
+litesvm = "0.3"
 tokio        = { version = "1.38", features = ["full"] }
 tokio-stream = "0.1"
 
