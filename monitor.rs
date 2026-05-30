@@ -1,6 +1,13 @@
 // geyser subscriber. account updates → pool/obligation state.
 // tx updates → smart money classification + pending swap extraction.
-// reconnects forever on error because the stream will drop periodically and that's normal.
+// reconnects forever on error because the stream drops periodically and that's normal.
+//
+// FILTERING STRATEGY:
+//   1. server-side: geyser `owner` filter drops everything not owned by our program IDs.
+//      this is free — the validator does it before the packet hits the network.
+//   2. client-side first gate: check account data length before touching any offsets.
+//   3. discriminant check: first 8 bytes must match the expected account type.
+//      bails out before any field parsing on garbage/unrelated accounts.
 use anyhow::Result;
 use futures::StreamExt;
 use solana_sdk::pubkey::Pubkey;
@@ -11,7 +18,7 @@ use tracing::{debug, error, info, warn};
 use yellowstone_grpc_client::GeyserGrpcClient;
 use yellowstone_grpc_proto::prelude::{
     CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
-    SubscribeRequestFilterTransactions, SubscribeUpdateAccountInfo,
+    SubscribeRequestFilterTransactions,
 };
 
 use crate::{
@@ -22,12 +29,21 @@ use crate::{
     state::{Dex, LendingProtocol, ObligationState, PoolState, CURRENT_SLOT, OBLIGATIONS, POOLS},
 };
 
-// program IDs — keep these in sync with registry.rs defaults
+// program IDs — keep in sync with registry.rs defaults
 const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 const ORCA_SWAP_V2:   &str = "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP";
 const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const KAMINO_LENDING: &str = "KLend2g3cP87fffoy8q1mQqGKjrL1AyGGFsDGJr5J6Z";
 const SOLEND_PROGRAM: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
+
+// Raydium AMM v4 account discriminant — first 8 bytes of the on-chain layout.
+// verify with: solana account <pool> --output json | head. if this changes, raydium redeployed.
+const RAYDIUM_POOL_DISC: [u8; 8] = [0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00];
+// Kamino obligation anchor discriminant (sha256("account:Obligation")[..8])
+const KAMINO_OBLIGATION_DISC: [u8; 8] = [0xca, 0x5d, 0x0c, 0x6b, 0x7e, 0x3d, 0x41, 0x72];
+// minimum sane data sizes — saves us from indexing into garbage buffers
+const RAYDIUM_POOL_MIN_LEN: usize  = 0x1A0;
+const OBLIGATION_MIN_LEN:   usize  = 200;
 
 #[derive(Debug, Clone)]
 pub struct PendingSwap {
@@ -103,16 +119,37 @@ impl Monitor {
             .as_ref()
             .map(|r| r.active_program_id_strings())
             .unwrap_or_else(|| vec![
-                // fallback to hardcoded defaults if no registry. ugly but fine for dev.
+                // fallback hardcoded defaults. ugly but fine for dev.
                 RAYDIUM_AMM_V4.to_string(), ORCA_SWAP_V2.to_string(),
                 ORCA_WHIRLPOOL.to_string(), KAMINO_LENDING.to_string(),
                 SOLEND_PROGRAM.to_string(),
             ]);
 
+        // server-side filter: only accounts owned by our AMM/lending programs.
+        // this is the biggest lever — geyser drops the rest before sending anything over gRPC.
+        //
+        // NOTE: memcmp discriminant filters (offset=0, 8-byte match) would further reduce
+        // traffic but the exact proto path varies between yellowstone-grpc versions.
+        // TODO: add memcmp once we pin the yellowstone version and verify the generated types:
+        //   subscribe_request_filter_accounts_filter::Filter::Memcmp with
+        //   SubscribeRequestFilterAccountsFilterMemcmp { offset: 0, data: RAYDIUM_POOL_DISC }
         let mut accounts_filter = HashMap::new();
-        accounts_filter.insert("amm_pools".to_string(), SubscribeRequestFilterAccounts {
-            account: vec![], owner: program_ids.clone(), filters: vec![],
+
+        accounts_filter.insert("raydium_pools".to_string(), SubscribeRequestFilterAccounts {
+            account: vec![],
+            owner:   vec![RAYDIUM_AMM_V4.to_string()],
+            filters: vec![],
             ..Default::default()
+        });
+
+        accounts_filter.insert("orca_pools".to_string(), SubscribeRequestFilterAccounts {
+            account: vec![], owner: vec![ORCA_SWAP_V2.to_string(), ORCA_WHIRLPOOL.to_string()],
+            filters: vec![], ..Default::default()
+        });
+
+        accounts_filter.insert("obligations".to_string(), SubscribeRequestFilterAccounts {
+            account: vec![], owner: vec![KAMINO_LENDING.to_string(), SOLEND_PROGRAM.to_string()],
+            filters: vec![], ..Default::default()
         });
 
         let mut tx_filter = HashMap::new();
@@ -126,9 +163,9 @@ impl Monitor {
         });
 
         let request = SubscribeRequest {
-            accounts:   accounts_filter,
+            accounts:    accounts_filter,
             transactions: tx_filter,
-            commitment: Some(CommitmentLevel::Processed as i32),
+            commitment:  Some(CommitmentLevel::Processed as i32),
             ..Default::default()
         };
 
@@ -163,12 +200,15 @@ impl Monitor {
         let Ok(pubkey) = Pubkey::try_from(acc.pubkey.as_slice()) else { return };
         let Ok(owner)  = Pubkey::try_from(acc.owner.as_slice())  else { return };
 
+        // apply delta to account cache regardless of account type.
+        // this is the path for state-delta updates: geyser sends the full account data
+        // on every write, so upsert here keeps the sim cache current without a separate fetch.
         if let Some(ref cache) = self.account_cache {
-            cache.upsert(pubkey, acc.lamports, acc.data.clone(), owner, false);
+            cache.apply_delta(pubkey, acc.lamports, acc.data.clone(), owner);
         }
 
         if is_amm_owner(&owner) {
-            if let Some(pool) = decode_raydium_pool(pubkey, &acc.data, slot) {
+            if let Some(pool) = decode_pool(pubkey, &owner, &acc.data, slot) {
                 if let Some(ref risk) = self.risk { risk.on_pool_update(&pool); }
                 POOLS.insert(pubkey, pool);
                 let _ = self.tx.try_send(Opportunity::PoolUpdated(pubkey));
@@ -228,14 +268,34 @@ fn is_lending_owner(owner: &Pubkey) -> bool {
     s == KAMINO_LENDING || s == SOLEND_PROGRAM
 }
 
-// hardcoded raydium AMM v4 layout offsets. if raydium deploys a v5 we'll need to revisit.
-// offsets verified against the on-chain IDL, not the docs (docs are sometimes wrong).
+// unified pool decoder — dispatches by owner program.
+// discriminant check is the first thing we do. cheap comparison before touching any field offsets.
+fn decode_pool(pubkey: Pubkey, owner: &Pubkey, data: &[u8], slot: u64) -> Option<PoolState> {
+    let owner_str = owner.to_string();
+    if owner_str == RAYDIUM_AMM_V4 {
+        decode_raydium_pool(pubkey, data, slot)
+    } else {
+        // orca/whirlpool: TODO — layout differs per pool version.
+        // at minimum check discriminant before returning None to avoid log spam.
+        None
+    }
+}
+
+// hardcoded raydium AMM v4 layout. offsets verified against on-chain IDL, not the docs.
 fn decode_raydium_pool(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<PoolState> {
-    if data.len() < 0x1A0 { return None; }
+    // discriminant check first — bails before any offset math on wrong account types.
+    // this catches fee collector accounts, config accounts, etc that pass the owner filter.
+    if data.len() < RAYDIUM_POOL_MIN_LEN { return None; }
+    if data[..8] != RAYDIUM_POOL_DISC    { return None; }
+
     let coin_mint = Pubkey::try_from(&data[0xB8..0xD8]).ok()?;
     let pc_mint   = Pubkey::try_from(&data[0xD8..0xF8]).ok()?;
     let reserve_a = u64::from_le_bytes(data[0x190..0x198].try_into().ok()?);
     let reserve_b = u64::from_le_bytes(data[0x198..0x1A0].try_into().ok()?);
+
+    // skip pools with zero reserves — nothing to trade against and they'll spew NaN into the arb graph
+    if reserve_a == 0 || reserve_b == 0 { return None; }
+
     Some(PoolState {
         pool_id: pubkey, dex: Dex::Raydium,
         token_a_mint: coin_mint, token_b_mint: pc_mint,
@@ -244,28 +304,33 @@ fn decode_raydium_pool(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<PoolSta
 }
 
 // minimal obligation decode. collateral/borrow at fixed offsets — works for kamino v1 and solend.
-// marginfi has a completely different layout; add it when we care.
+// marginfi has a different layout; add it when we actually need it.
 fn decode_obligation(pubkey: Pubkey, program: &Pubkey, data: &[u8], slot: u64) -> Option<ObligationState> {
-    if data.len() < 200 { return None; }
+    if data.len() < OBLIGATION_MIN_LEN { return None; }
+
+    // kamino uses anchor discriminants; check before parsing fields
     let protocol = if program.to_string() == KAMINO_LENDING {
+        if data[..8] != KAMINO_OBLIGATION_DISC { return None; }
         LendingProtocol::Kamino
     } else {
-        LendingProtocol::Solend
+        LendingProtocol::Solend // solend doesn't use anchor discriminants
     };
+
     let collateral_value = u128::from_le_bytes(data[32..48].try_into().ok()?);
     let borrow_value     = u128::from_le_bytes(data[48..64].try_into().ok()?);
     let owner            = Pubkey::from(<[u8; 32]>::try_from(&data[8..40]).ok()?);
+
     Some(ObligationState {
         obligation_pubkey: pubkey, owner, protocol,
         collateral_value, borrow_value,
-        liquidation_threshold_bps: 8500, // 85% LTV. could vary per market but this is the common case
+        liquidation_threshold_bps: 8500, // 85% LTV. most markets, not all. good enough for now.
         slot,
     })
 }
 
-// TODO: actually decode swap instructions here.
-// need per-protocol discriminant matching + argument parsing.
-// until this is implemented, sandwich detection can never fire. tracked in #52.
+// TODO: decode swap instructions from tx data (#52).
+// per-protocol discriminant matching + argument parsing needed.
+// without this, sandwich detection can never fire.
 fn extract_pending_swap(
     _slot: u64,
     _tx:   &yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo,
