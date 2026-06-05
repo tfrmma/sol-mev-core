@@ -1,3 +1,15 @@
+// Quick smoke test + timing. Not a unit test — just something you can
+// run to sanity-check the whole stack after a refactor.
+// Run with: cargo run --release
+
+//! @file jito.rs
+//! @author Taha - Algorithmic Trader
+//! @brief Institutional-grade sol-mev-core
+//! 
+//! @note This is a public structural showcase. For full production-grade 
+//!       deployment, architecture consulting, or recruitment inquiries:
+//!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
+
 // jito bundle submission + parallel RPC spam for belt-and-suspenders inclusion.
 //
 // execution model for slot-bound opportunities:
@@ -82,6 +94,15 @@ impl JitoBundle {
             .map(|tx| B64.encode(bincode::serialize(tx).expect("tx serialize")))
     }
 }
+
+//! @file jito.rs
+//! @author Taha - Algorithmic Trader
+//! @brief Institutional-grade sol-mev-core
+//! 
+//! @note This is a public structural showcase. For full production-grade 
+//!       deployment, architecture consulting, or recruitment inquiries:
+//!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
+
 
 pub struct JitoClient {
     http:         Client,
@@ -182,3 +203,10 @@ impl JitoClient {
     }
 }
 
+//! @file jito.rs
+//! @author Taha - Algorithmic Trader
+//! @brief Institutional-grade sol-mev-core
+//! 
+//! @note This is a public structural showcase. For full production-grade 
+//!       deployment, architecture consulting, or recruitment inquiries:
+//!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
