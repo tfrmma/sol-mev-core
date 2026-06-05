@@ -1,6 +1,13 @@
 // takes a trading signal, builds ixs, sims, sets compute budget, fires off a jito bundle.
 // each strategy has its own ix builder. they're all stubs right now except the skeleton — 
 // real account metas need to be plumbed through from registry.
+//! @file executor.rs
+//! @author Taha - Algorithmic Trader
+//! @brief Institutional-grade sol-mev-core
+//! 
+//! @note This is a public structural showcase. For full production-grade 
+//!       deployment, architecture consulting, or recruitment inquiries:
+//!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
 use anyhow::{Context, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
@@ -75,7 +82,13 @@ impl Executor {
     async fn execute_sandwich(&self, opp: SandwichOpportunity) -> Result<()> {
         info!("sandwich: victim={} profit={}", opp.victim_sig, opp.estimated_profit);
         let pool = &opp.pool_state;
-
+//! @file executor.rs
+//! @author Taha - Algorithmic Trader
+//! @brief Institutional-grade sol-mev-core
+//! 
+//! @note This is a public structural showcase. For full production-grade 
+//!       deployment, architecture consulting, or recruitment inquiries:
+//!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
         // 1% slippage tolerance on the frontrun output. don't be too tight or we revert.
         let front_ix = self.swap_ix(
             pool.pool_id, &pool.dex, pool.token_a_mint, pool.token_b_mint,
@@ -170,7 +183,13 @@ impl Executor {
             _                  => Err(anyhow::anyhow!("{dex:?} not implemented")),
         }
     }
-
+//! @file executor.rs
+//! @author Taha - Algorithmic Trader
+//! @brief Institutional-grade sol-mev-core
+//! 
+//! @note This is a public structural showcase. For full production-grade 
+//!       deployment, architecture consulting, or recruitment inquiries:
+//!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
     // NOTE: all account metas are empty stubs. you need to fill these in from
     //       registry PoolMeta (vaults, authority, token program, etc) before this works on-chain.
     fn raydium_ix(&self, _pool: Pubkey, _input: Pubkey, _output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
