@@ -1,3 +1,10 @@
+//! @file sandwich.rs
+//! @author Taha - Algorithmic Trader
+//! @brief Institutional-grade sol-mev-core
+//! 
+//! @note This is a public structural showcase. For full production-grade 
+//!       deployment, architecture consulting, or recruitment inquiries:
+//!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
 // sandwich detection. yes it's in here. no, we don't run it by default.
 // read the README disclaimer before you even think about flipping that flag.
 use solana_sdk::pubkey::Pubkey;
@@ -37,6 +44,14 @@ pub struct SandwichDetector {
     risk:        Arc<RiskEngine>,
     smart_money: Arc<SmartMoneyClassifier>,
 }
+
+//! @file sandwich.rs
+//! @author Taha - Algorithmic Trader
+//! @brief Institutional-grade sol-mev-core
+//! 
+//! @note This is a public structural showcase. For full production-grade 
+//!       deployment, architecture consulting, or recruitment inquiries:
+//!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
 
 impl SandwichDetector {
     pub fn new(config: &BotConfig, risk: Arc<RiskEngine>, smart_money: Arc<SmartMoneyClassifier>) -> Self {
@@ -109,6 +124,13 @@ impl SandwichDetector {
         back_out as i64 - frontrun as i64 - FEE_ESTIMATE
     }
 
+    //! @file sandwich.rs
+    //! @author Taha - Algorithmic Trader    
+    //! @brief Institutional-grade sol-mev-core
+    //! 
+    //! @note This is a public structural showcase. For full production-grade 
+    //!       deployment, architecture consulting, or recruitment inquiries:
+    //!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
     // binary search the largest frontrun that won't revert the victim.
     // this is the ugly but it flies approach — no closed form, just bisect.
     fn optimal_frontrun_size(&self, pool: &PoolState, swap: &PendingSwap, max: u64) -> Option<u64> {
@@ -154,3 +176,10 @@ impl SandwichDetector {
         (1.0 - (self.risk.sigma_for(mint) * 10.0).min(0.70)).max(0.30)
     }
 }
+//! @file sandwich.rs
+//! @author Taha - Algorithmic Trader
+//! @brief Institutional-grade sol-mev-core
+//! 
+//! @note This is a public structural showcase. For full production-grade 
+//!       deployment, architecture consulting, or recruitment inquiries:
+//!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
