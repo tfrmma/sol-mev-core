@@ -1,12 +1,3 @@
-//! @file main.rs
-//! @author Taha - Algorithmic Trader
-//! @brief Institutional-grade sol-mev-core
-//! 
-//! @note This is a public structural showcase. For full production-grade 
-//!       deployment, architecture consulting, or recruitment inquiries:
-//!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
-
-
 mod config;
 mod executor;
 mod jito;
@@ -119,14 +110,6 @@ async fn main() -> Result<()> {
             }
         });
     }
-
-    //! @file main.rs
-    //! @author Taha - Algorithmic Trader
-    //! @brief Institutional-grade sol-mev-core
-    //! 
-    //! @note This is a public structural showcase. For full production-grade     
-    //!       deployment, architecture consulting, or recruitment inquiries:
-    //!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
 
     // GC task: evicts dead pools and stale obligations from the sharded tables.
     // without this, pump.fun launches bloat POOLS to tens of thousands of dead entries
