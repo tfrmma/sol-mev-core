@@ -1,5 +1,5 @@
 // program + pool registry. loaded from registry.json at startup.
-// hot-reload is supported but we only do a stale check — no inotify nonsense.
+// hot-reload is supported but we only do a stale check, no inotify nonsense.
 // add new pools to registry.json; the bot picks them up on next registry refresh.
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -78,8 +78,8 @@ impl RegistryFile {
             let raw = std::fs::read_to_string(path).context("read registry.json")?;
             return serde_json::from_str(&raw).context("parse registry.json");
         }
-        // first run — write defaults and continue. operator can populate pools later.
-        warn!("registry.json not found — writing defaults");
+        // first run, write defaults and continue. operator can populate pools later.
+        warn!("registry.json not found, writing defaults");
         let default = Self::default_mainnet();
         std::fs::write(path, serde_json::to_string_pretty(&default)?)?;
         Ok(default)
@@ -142,6 +142,7 @@ impl ProgramRegistry {
     pub fn pool_meta(&self, id: &Pubkey) -> Option<&PoolMeta>           { self.pools.get(id) }
     pub fn pool_count(&self) -> usize                                    { self.pools.len() }
     pub fn active_program_ids(&self) -> &[Pubkey]                       { &self.active_program_ids }
+    pub fn all_pool_ids(&self) -> Vec<Pubkey>                             { self.pools.keys().cloned().collect() }
     pub fn needs_reload(&self, period: Duration) -> bool                 { self.last_reload.elapsed() >= period }
 
     pub fn pools_for_pair(&self, a: Pubkey, b: Pubkey) -> &[Pubkey] {
@@ -181,6 +182,10 @@ impl Registry {
 
     pub fn active_program_ids(&self) -> Vec<Pubkey> {
         self.0.read().unwrap().active_program_ids().to_vec()
+    }
+
+    pub fn all_pool_ids(&self) -> Vec<Pubkey> {
+        self.0.read().unwrap().all_pool_ids()
     }
 
     pub fn active_program_id_strings(&self) -> Vec<String> {
