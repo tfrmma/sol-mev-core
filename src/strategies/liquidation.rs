@@ -1,183 +1,163 @@
-// jito bundle submission + parallel RPC spam for belt-and-suspenders inclusion.
-//
-// execution model for slot-bound opportunities:
-//   - NO retry loops with sleep. if the bundle is stale, it's dead. move on.
-//   - fire jito bundle AND raw sendTransaction to N backup RPCs in parallel.
-//   - first confirmation wins. the others are just noise at that point.
-//
-// jito block engine SLA: 400ms timeout, max 5 txs per bundle, tip ix must be last.
-use anyhow::{Context, Result};
-use base64::{engine::general_purpose::STANDARD as B64, Engine};
-use rand::Rng;
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use solana_sdk::{
-    hash::Hash, pubkey::Pubkey, signature::Keypair, signer::Signer,
-    system_instruction, transaction::VersionedTransaction,
-    message::{v0, VersionedMessage},
-};
-use std::time::Duration;
+use solana_sdk::{instruction::{AccountMeta, Instruction}, pubkey::Pubkey};
+use std::sync::Arc;
 use tracing::{debug, info, warn};
 
-// verified against https://jito-labs.gitbook.io/mev/searcher-resources/tip-payment-program
-// do NOT use your own address — you won't get tip routing and the validator won't prioritize you
-const TIP_ACCOUNTS: &[&str] = &[
-    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
-    "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
-    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY",
-    "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
-    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh",
-    "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
-    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL",
-    "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
-];
+use crate::config::BotConfig;
+use crate::risk::RiskEngine;
+use crate::state::{LendingProtocol, ObligationState, PoolState, OBLIGATIONS, POOLS};
 
-fn random_tip_account() -> Pubkey {
-    TIP_ACCOUNTS[rand::thread_rng().gen_range(0..TIP_ACCOUNTS.len())].parse().unwrap()
+#[derive(Debug, Clone)]
+pub struct LiqOpportunity {
+    pub obligation:               Pubkey,
+    pub protocol:                 LendingProtocol,
+    pub owner:                    Pubkey,
+    pub repay_amount:             u64,
+    pub repay_mint:               Pubkey,
+    pub collateral_mint:          Pubkey,
+    pub gross_profit_lamports:    i64,
+    pub adjusted_profit_lamports: Option<i64>, // None means risk engine vetoed it
+    pub health_factor:            f64,
 }
 
-#[derive(Serialize)]
-struct RpcRequest {
-    jsonrpc: &'static str,
-    id:      u64,
-    method:  &'static str,
-    params:  Vec<serde_json::Value>,
-}
-
-#[derive(Deserialize, Debug)]
-pub struct BundleResponse {
-    pub result: Option<String>,
-    pub error:  Option<serde_json::Value>,
-}
-
-pub struct JitoBundle {
-    pub transactions: Vec<VersionedTransaction>,
-    pub tip_lamports: u64,
-}
-
-impl JitoBundle {
-    // appends the tip transfer as the last tx. jito requires this ordering.
-    pub fn attach_tip(mut self, payer: &Keypair, blockhash: Hash) -> Self {
-        let tip_ix = system_instruction::transfer(
-            &payer.pubkey(), &random_tip_account(), self.tip_lamports,
-        );
-        let msg = v0::Message::try_compile(&payer.pubkey(), &[tip_ix], &[], blockhash)
-            .expect("tip message compile");
-        let tip_tx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[payer])
-            .expect("tip tx sign");
-        self.transactions.push(tip_tx);
-        self
-    }
-
-    pub fn encode(&self) -> Vec<String> {
-        self.transactions.iter()
-            .map(|tx| B64.encode(bincode::serialize(tx).expect("tx serialize")))
-            .collect()
-    }
-
-    // encode just the primary tx (not the tip) for raw RPC spam.
-    // the tip ix is jito-only — no point sending it to vanilla validators.
-    pub fn encode_primary(&self) -> Option<String> {
-        self.transactions.first()
-            .map(|tx| B64.encode(bincode::serialize(tx).expect("tx serialize")))
+impl LiqOpportunity {
+    pub fn effective_profit(&self) -> i64 {
+        self.adjusted_profit_lamports.unwrap_or(self.gross_profit_lamports)
     }
 }
 
-pub struct JitoClient {
-    http:         Client,
-    endpoint:     String,
-    spam_clients: Vec<(Client, String)>, // backup RPC endpoints for parallel spam
+pub struct LiquidationScanner {
+    min_profit: u64,
+    liquidator: Pubkey,
+    risk:       Arc<RiskEngine>,
 }
 
-impl JitoClient {
-    pub fn new(endpoint: &str, _max_retries: u32) -> Self {
-        // _max_retries kept in signature for API compat but ignored.
-        // slot-bound opportunities don't retry — stale = dead.
-        let http = Client::builder()
-            .timeout(Duration::from_millis(400))
-            .build()
-            .unwrap();
-        Self { http, endpoint: endpoint.to_string(), spam_clients: Vec::new() }
+impl LiquidationScanner {
+    pub fn new(config: &BotConfig, liquidator: Pubkey, risk: Arc<RiskEngine>) -> Self {
+        Self { min_profit: config.min_profit_lamports, liquidator, risk }
     }
 
-    // register additional RPC endpoints for parallel spam.
-    // call this at startup with your fastest 2-3 non-jito RPCs.
-    pub fn with_spam_endpoints(mut self, endpoints: Vec<String>) -> Self {
-        self.spam_clients = endpoints.into_iter().map(|url| {
-            let c = Client::builder()
-                .timeout(Duration::from_millis(300))
-                .build()
-                .unwrap();
-            (c, url)
-        }).collect();
-        self
-    }
+    pub fn evaluate(&self, obligation_key: Pubkey) -> Option<LiqOpportunity> {
+        let obl = OBLIGATIONS.get_cloned(&obligation_key)?;
+        if !obl.is_underwater() { return None; }
 
-    // fire jito bundle + raw RPC spam simultaneously. no retries — if it misses, it misses.
-    // returns the jito bundle UUID if the bundle was accepted (spam is fire-and-forget).
-    pub async fn send_bundle(&self, bundle: &JitoBundle) -> Result<String> {
-        let payload = RpcRequest {
-            jsonrpc: "2.0", id: 1, method: "sendBundle",
-            params: vec![serde_json::json!(bundle.encode())],
-        };
+        info!("underwater {} hf={:.4} ltv={}/{} protocol={:?}",
+              obligation_key, obl.health_factor(), obl.ltv_bps(),
+              obl.liquidation_threshold_bps, obl.protocol);
 
-        debug!("firing bundle: {} txs + {} spam endpoints",
-               bundle.transactions.len(), self.spam_clients.len());
-
-        // kick off RPC spam in the background — don't await, don't care about errors
-        if let Some(encoded) = bundle.encode_primary() {
-            for (client, url) in &self.spam_clients {
-                let c    = client.clone();
-                let u    = url.clone();
-                let body = serde_json::json!({
-                    "jsonrpc": "2.0", "id": 1,
-                    "method": "sendTransaction",
-                    "params": [encoded, {"encoding": "base64", "skipPreflight": true}]
-                });
-                tokio::spawn(async move {
-                    if let Err(e) = c.post(&u).json(&body).send().await {
-                        debug!("rpc spam {u} failed: {e}"); // non-fatal, expected sometimes
-                    }
-                });
-            }
+        let opp = self.build_opportunity(&obl)?;
+        if opp.effective_profit() < self.min_profit as i64 {
+            debug!("profit too low: {} (adjusted={:?})", opp.gross_profit_lamports, opp.adjusted_profit_lamports);
+            return None;
         }
+        info!("liquidation: obligation={} gross={} adjusted={:?}",
+              obligation_key, opp.gross_profit_lamports, opp.adjusted_profit_lamports);
+        Some(opp)
+    }
 
-        // jito submission — single attempt, no sleep, no retry loop
-        match self.try_send(&payload).await {
-            Ok(uuid) => {
-                info!("bundle accepted uuid={uuid}");
-                Ok(uuid)
-            }
-            Err(e) => {
-                // log and propagate. caller decides whether to care.
-                warn!("bundle rejected: {e}");
-                Err(e)
-            }
+    // scan everything. called less frequently than evaluate() don't be ashamed of the O(n).
+    pub fn scan_all(&self) -> Vec<LiqOpportunity> {
+        let mut opps: Vec<_> = OBLIGATIONS.collect_all().into_iter()
+            .filter(|o| o.is_underwater())
+            .filter_map(|o| {
+                let opp = self.build_opportunity(&o)?;
+                (opp.effective_profit() >= self.min_profit as i64).then_some(opp)
+            })
+            .collect();
+        opps.sort_by(|a, b| b.effective_profit().cmp(&a.effective_profit()));
+        opps
+    }
+
+    pub fn build_kamino_liquidation_ix(&self, opp: &LiqOpportunity) -> Instruction {
+        let program_id: Pubkey = "KLend2g3cP87fffoy8q1mQqGKjrL1AyGGFsDGJr5J6Z".parse().unwrap();
+        // discriminant from idl. if kamino redeploys and changes this we'll find out the hard way.
+        let disc: [u8; 8] = [0xb5, 0xe9, 0x4c, 0xbb, 0x68, 0x91, 0x24, 0x1d];
+        let mut data = disc.to_vec();
+        data.extend_from_slice(&opp.repay_amount.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes()); // min_acceptable_received_collateral_amount
+        Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(self.liquidator, true),
+                AccountMeta::new(opp.obligation, false),
+                // TODO: add remaining accounts from obligation collateral+reserve metadata.
+                //       right now this ix will fail on-chain. need to parse the full obligation
+                //       layout to pull vault/reserve/oracle pubkeys. tracked in #47.
+            ],
+            data,
         }
     }
 
-    async fn try_send(&self, payload: &RpcRequest) -> Result<String> {
-        let body: BundleResponse = self.http
-            .post(&self.endpoint)
-            .json(payload)
-            .send()
-            .await?
-            .json()
-            .await
-            .context("deserialize jito response")?;
+    fn build_opportunity(&self, obl: &ObligationState) -> Option<LiqOpportunity> {
+        let close_factor = self.close_factor(obl);
+        let repay_value  = obl.borrow_value * close_factor as u128 / 10_000;
+        let repay_lamps  = (repay_value / 1_000_000_000) as u64;
+        let bonus_bps    = self.bonus_bps(obl);
+        let collateral   = repay_lamps + repay_lamps * bonus_bps / 10_000;
+        let gross        = collateral as i64 - repay_lamps as i64;
 
-        body.result.ok_or_else(|| anyhow::anyhow!("jito error: {:?}", body.error))
-    }
+        // FIXME: both mints are wrong need to decode from the obligation's deposit/borrow lists.
+        //        using owner as placeholder so it at least compiles. don't ship this.
+        let collateral_mint = obl.owner;
+        let repay_mint      = obl.owner;
 
-    // mostly useful for debugging landed bundles. don't poll in a hot loop.
-    pub async fn get_bundle_status(&self, uuid: &str) -> Result<String> {
-        let payload = serde_json::json!({
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getBundleStatuses",
-            "params": [[uuid]],
+        let adjusted = self.best_exit_pool(collateral_mint).and_then(|pool| {
+            let exit_is_a = pool.token_a_mint == collateral_mint;
+            self.risk.adjusted_profit(gross, collateral_mint, &pool, collateral, exit_is_a)
         });
-        let url = self.endpoint.replace("bundles", "getBundleStatuses");
-        let val: serde_json::Value = self.http.post(&url).json(&payload).send().await?.json().await?;
-        Ok(val.to_string())
+
+        Some(LiqOpportunity {
+            obligation: obl.obligation_pubkey,
+            protocol: obl.protocol.clone(),
+            owner: obl.owner,
+            repay_amount: repay_lamps,
+            repay_mint,
+            collateral_mint,
+            gross_profit_lamports: gross,
+            adjusted_profit_lamports: adjusted,
+            health_factor: obl.health_factor(),
+        })
+    }
+
+    fn close_factor(&self, obl: &ObligationState) -> u64 {
+        match obl.protocol {
+            LendingProtocol::Kamino => self.kamino_close_factor(obl),
+            // solend and marginfi both use 50% flat. boring but fine.
+            LendingProtocol::Solend | LendingProtocol::MarginFi => 5_000,
+        }
+    }
+
+    fn bonus_bps(&self, obl: &ObligationState) -> u64 {
+        match obl.protocol {
+            LendingProtocol::Kamino => {
+                // tiered bonus based on how far underwater they are
+                let excess = obl.ltv_bps().saturating_sub(obl.liquidation_threshold_bps);
+                if excess > 1000 { 1500 } else if excess > 500 { 1000 } else { 700 }
+            }
+            _ => 500, // 5% flat for everyone else
+        }
+    }
+
+    // kamino's dynamic close factor: slides from ~20% at threshold up to 100% at full insolvency.
+    // getting this wrong is expensive overclosing burns capital, underclosing leaves profit on table.
+    fn kamino_close_factor(&self, obl: &ObligationState) -> u64 {
+        let ltv       = obl.ltv_bps() as u64;
+        let threshold = obl.liquidation_threshold_bps as u64;
+        if ltv >= 10_000 { return 10_000; }
+        let excess = ltv.saturating_sub(threshold);
+        let range  = 10_000u64.saturating_sub(threshold).max(1);
+        (2_000 + excess * 8_000 / range).min(10_000)
+    }
+
+    // find deepest pool for this collateral. deep = less slippage on exit.
+    fn best_exit_pool(&self, mint: Pubkey) -> Option<PoolState> {
+        let mut best: Option<PoolState> = None;
+        let mut best_liq = 0u64;
+        POOLS.for_each(|_, pool| {
+            if pool.token_a_mint == mint || pool.token_b_mint == mint {
+                let liq = pool.reserve_a.min(pool.reserve_b);
+                if liq > best_liq { best_liq = liq; best = Some(pool.clone()); }
+            }
+        });
+        best
     }
 }
