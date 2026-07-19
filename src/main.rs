@@ -30,7 +30,7 @@ use crate::{
 const OPP_CHAN: usize        = 512;
 const SIGNAL_CHAN: usize     = 128;
 const REGISTRY_TTL: Duration = Duration::from_secs(300);
-// GC runs every 30s. at 400ms/slot that's ~75 slots between sweeps — plenty of headroom.
+// GC runs every 30s. at 400ms/slot that's ~75 slots between sweeps, plenty of headroom.
 const GC_INTERVAL: Duration  = Duration::from_secs(30);
 
 #[tokio::main]
@@ -61,7 +61,7 @@ async fn main() -> Result<()> {
     {
         info!("warming account cache…");
         let rpc_sim   = RpcSimulator::new(&config.rpc_url);
-        let pool_keys = registry.active_program_ids();
+        let pool_keys = registry.all_pool_ids();
         match rpc_sim.warm_cache(&pool_keys, &cache).await {
             Ok(n)  => info!("cache warm: {n} accounts"),
             Err(e) => warn!("partial cache warm: {e:#}"), // non-fatal, sim will fall back to RPC on miss
@@ -158,7 +158,7 @@ async fn main() -> Result<()> {
                     info!("smart money {addr}  score={score:.3}");
                 }
                 let mut vols = risk.volatility_report();
-                vols.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                vols.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 if let Some((mint, sigma)) = vols.first() {
                     if *sigma > 0.01 { info!("highest vol {mint}  σ={sigma:.4}"); }
                 }
@@ -166,7 +166,7 @@ async fn main() -> Result<()> {
         });
     }
 
-    info!("running — ctrl+c to stop");
+    info!("running, ctrl+c to stop");
     tokio::signal::ctrl_c().await?;
     Ok(())
 }
