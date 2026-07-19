@@ -54,7 +54,7 @@ impl LiquidationScanner {
         Some(opp)
     }
 
-    // scan everything. called less frequently than evaluate() don't be ashamed of the O(n).
+    // scan everything. called less frequently than evaluate(), don't be ashamed of the O(n).
     pub fn scan_all(&self) -> Vec<LiqOpportunity> {
         let mut opps: Vec<_> = OBLIGATIONS.collect_all().into_iter()
             .filter(|o| o.is_underwater())
@@ -95,7 +95,7 @@ impl LiquidationScanner {
         let collateral   = repay_lamps + repay_lamps * bonus_bps / 10_000;
         let gross        = collateral as i64 - repay_lamps as i64;
 
-        // FIXME: both mints are wrong need to decode from the obligation's deposit/borrow lists.
+        // FIXME: both mints are wrong, need to decode from the obligation's deposit/borrow lists.
         //        using owner as placeholder so it at least compiles. don't ship this.
         let collateral_mint = obl.owner;
         let repay_mint      = obl.owner;
@@ -138,7 +138,7 @@ impl LiquidationScanner {
     }
 
     // kamino's dynamic close factor: slides from ~20% at threshold up to 100% at full insolvency.
-    // getting this wrong is expensive overclosing burns capital, underclosing leaves profit on table.
+    // getting this wrong is expensive, overclosing burns capital, underclosing leaves profit on table.
     fn kamino_close_factor(&self, obl: &ObligationState) -> u64 {
         let ltv       = obl.ltv_bps() as u64;
         let threshold = obl.liquidation_threshold_bps as u64;
