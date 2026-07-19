@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::{
     commitment_config::CommitmentConfig,
-    instruction::Instruction,
+    instruction::{AccountMeta, Instruction},
     message::{v0, VersionedMessage},
     pubkey::Pubkey,
     signature::Keypair,
@@ -18,6 +18,7 @@ use tracing::{info, warn};
 use crate::{
     config::BotConfig,
     jito::{JitoBundle, JitoClient},
+    registry::{PoolMeta, Registry},
     simulator::Simulator,
     state::Dex,
     strategies::{
@@ -28,22 +29,40 @@ use crate::{
     },
 };
 
+// well-known, program-independent constants. these never change per-pool.
+const SPL_TOKEN_PROGRAM_ID:        &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+// single global authority shared by every raydium AMM v4 pool, not per-pool.
+// verified against docs.raydium.io/reference/program-addresses.
+const RAYDIUM_AMM_V4_AUTHORITY: &str = "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1";
+
+// derives a wallet's associated token account without pulling in spl-associated-token-account,
+// which is what dragged us into the whole solana-zk-token-sdk version hell on 1.18. this is just
+// the standard ATA PDA, seeds = [wallet, token_program, mint], nothing exotic.
+fn derive_ata(wallet: &Pubkey, mint: &Pubkey) -> Result<Pubkey> {
+    let token_program: Pubkey = SPL_TOKEN_PROGRAM_ID.parse()?;
+    let ata_program:   Pubkey = ASSOCIATED_TOKEN_PROGRAM_ID.parse()?;
+    let seeds = [wallet.as_ref(), token_program.as_ref(), mint.as_ref()];
+    Ok(Pubkey::find_program_address(&seeds, &ata_program).0)
+}
+
 pub struct Executor {
     rpc:       RpcClient,
     jito:      JitoClient,
     simulator: Arc<Simulator>,
     signer:    Keypair,
     config:    BotConfig,
+    registry:  Registry,
 }
 
 impl Executor {
-    pub fn new(config: BotConfig, signer: Keypair, simulator: Arc<Simulator>) -> Self {
+    pub fn new(config: BotConfig, signer: Keypair, simulator: Arc<Simulator>, registry: Registry) -> Self {
         let rpc  = RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
         // wire spam endpoints from simulator into jito client.
         // executor owns the jito client so this is the natural place to plumb them together.
         let jito = JitoClient::new(&config.jito_url, config.max_retries)
             .with_spam_endpoints(simulator.spam_endpoints.clone());
-        Self { rpc, jito, simulator, signer, config }
+        Self { rpc, jito, simulator, signer, config, registry }
     }
 
     pub async fn execute(&self, signal: TradingSignal) -> Result<()> {
@@ -161,42 +180,62 @@ impl Executor {
     }
 
     fn swap_ix(&self, pool: Pubkey, dex: &Dex, input: Pubkey, output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
+        let meta = self.registry.pool_meta(&pool)
+            .with_context(|| format!("no registry entry for pool {pool}, can't build accounts"))?;
         match dex {
-            Dex::Raydium       => self.raydium_ix(pool, input, output, amount_in, min_out),
-            Dex::Orca          => self.orca_ix(pool, input, output, amount_in, min_out),
-            Dex::OrcaWhirlpool => self.whirlpool_ix(pool, input, output, amount_in, min_out),
+            Dex::Raydium       => self.raydium_ix(&meta, input, output, amount_in, min_out),
+            Dex::Orca          => self.orca_ix(&meta, input, output, amount_in, min_out),
+            Dex::OrcaWhirlpool => self.whirlpool_ix(&meta, input, output, amount_in, min_out),
             // TODO: Lifinity and Meteora. meteora is a pain because of the dynamic fee model.
             _                  => Err(anyhow::anyhow!("{dex:?} not implemented")),
         }
     }
 
-    // NOTE: all account metas are empty stubs. you need to fill these in from
-    //       registry PoolMeta (vaults, authority, token program, etc) before this works on-chain.
-    fn raydium_ix(&self, _pool: Pubkey, _input: Pubkey, _output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
-        let pid: Pubkey = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8".parse()?;
-        let mut data = vec![9u8]; // SwapBaseIn discriminant
+    // SwapBaseInV2 (tag 16), verified against raydium-io/raydium-amm program/src/instruction.rs.
+    // migrated off the 18-account OpenBook-era layout in sept 2025, this is the current path.
+    //
+    // assumption baked into this: registry.token_a_vault is raydium's "coin" vault and
+    // token_b_vault is "pc" vault, matching whatever order token_a/token_b got assigned when
+    // the pool was registered. if swaps start reverting with a mint mismatch, check that first.
+    fn raydium_ix(&self, meta: &PoolMeta, input: Pubkey, output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
+        let program_id = meta.program_pubkey().context("bad program_id in registry")?;
+        let pool_id     = meta.pool_pubkey().context("bad pool_id in registry")?;
+        let coin_vault  = meta.vault_a_pk().context("bad token_a_vault in registry")?;
+        let pc_vault    = meta.vault_b_pk().context("bad token_b_vault in registry")?;
+        let authority: Pubkey     = RAYDIUM_AMM_V4_AUTHORITY.parse()?;
+        let token_program: Pubkey = SPL_TOKEN_PROGRAM_ID.parse()?;
+        let owner = self.signer.pubkey();
+
+        let mut data = vec![16u8]; // SwapBaseInV2 discriminant
         data.extend_from_slice(&amount_in.to_le_bytes());
         data.extend_from_slice(&min_out.to_le_bytes());
-        Ok(Instruction { program_id: pid, accounts: vec![], data })
+
+        let accounts = vec![
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new(pool_id, false),
+            AccountMeta::new_readonly(authority, false),
+            AccountMeta::new(coin_vault, false),
+            AccountMeta::new(pc_vault, false),
+            AccountMeta::new(derive_ata(&owner, &input)?, false),
+            AccountMeta::new(derive_ata(&owner, &output)?, false),
+            AccountMeta::new_readonly(owner, true),
+        ];
+
+        Ok(Instruction { program_id, accounts, data })
     }
 
-    fn orca_ix(&self, _pool: Pubkey, _input: Pubkey, _output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
-        let pid: Pubkey = "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP".parse()?;
-        let mut data = vec![1u8];
-        data.extend_from_slice(&amount_in.to_le_bytes());
-        data.extend_from_slice(&min_out.to_le_bytes());
-        data.push(1); // swap direction flag
-        Ok(Instruction { program_id: pid, accounts: vec![], data })
+    // TODO(#4): orca legacy token-swap accounts, needs a source-verified pass same as raydium above.
+    //           not doing it from memory, spl-token-swap's account order has to be checked against
+    //           solana-labs/solana-program-library/docs/src/token-swap.md before this ships.
+    fn orca_ix(&self, _meta: &PoolMeta, _input: Pubkey, _output: Pubkey, _amount_in: u64, _min_out: u64) -> Result<Instruction> {
+        Err(anyhow::anyhow!("orca ix builder not implemented yet, see TODO(#4)"))
     }
 
-    fn whirlpool_ix(&self, _pool: Pubkey, _input: Pubkey, _output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
-        let pid: Pubkey  = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc".parse()?;
-        let disc: [u8;8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8]; // swap anchor discriminant
-        let mut data = disc.to_vec();
-        data.extend_from_slice(&amount_in.to_le_bytes());
-        data.extend_from_slice(&min_out.to_le_bytes());
-        data.push(1);                              // a_to_b
-        data.extend_from_slice(&0u128.to_le_bytes()); // sqrtPriceLimit = 0 (no limit)
-        Ok(Instruction { program_id: pid, accounts: vec![], data })
+    // TODO(#4): whirlpool needs tick array accounts computed from the pool's current tick index
+    //           and tick spacing, which decode_pool() doesn't extract yet (monitor.rs only handles
+    //           raydium today). building this ix before that lands means guessing tick arrays,
+    //           which just fails on-chain. blocked on the whirlpool decoder, not on this function.
+    fn whirlpool_ix(&self, _meta: &PoolMeta, _input: Pubkey, _output: Pubkey, _amount_in: u64, _min_out: u64) -> Result<Instruction> {
+        Err(anyhow::anyhow!("whirlpool ix builder blocked on whirlpool pool decoding, see TODO(#4)"))
     }
 }
