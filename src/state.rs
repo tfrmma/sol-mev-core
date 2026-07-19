@@ -174,7 +174,8 @@ impl ObligationState {
     #[inline(always)]
     pub fn ltv_bps(&self) -> u16 {
         if self.collateral_value == 0 { return u16::MAX; }
-        ((self.borrow_value * 10_000 / self.collateral_value) as u16).min(u16::MAX)
+        let bps = self.borrow_value * 10_000 / self.collateral_value;
+        bps.min(u16::MAX as u128) as u16
     }
 
     #[inline(always)]
