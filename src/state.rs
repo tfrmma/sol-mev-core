@@ -86,12 +86,12 @@ impl<V: Clone + Send + Sync + 'static> ShardedTable<V> {
     }
 }
 
-// GC trait — lets callers drive eviction without knowing the value type internals.
+// GC trait, lets callers drive eviction without knowing the value type internals.
 pub trait HasSlot { fn slot(&self) -> u64; }
 
 impl<V: Clone + Send + Sync + HasSlot + 'static> ShardedTable<V> {
     // sweeps entries whose slot age exceeds `max_age_slots`. run from a background task.
-    // returns number of entries evicted — useful for metrics.
+    // returns number of entries evicted, useful for metrics.
     pub fn gc_stale(&self, current_slot: u64, max_age_slots: u64) -> usize {
         let mut evicted = 0usize;
         for shard in &self.shards {
