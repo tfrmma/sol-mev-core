@@ -76,7 +76,7 @@ impl ArbitrageScanner {
         edges
     }
 
-    // standard bellman-ford over –ln(rate) weights.
+    // standard bellman-ford over -ln(rate) weights.
     // negative cycle ↔ product-of-rates > 1 ↔ free money (modulo fees and latency).
     fn bellman_ford(&self, edges: &[ArbEdge]) -> Vec<Vec<ArbEdge>> {
         let mints: Vec<Pubkey> = {
@@ -88,14 +88,27 @@ impl ArbitrageScanner {
         let n   = mints.len();
         let idx: HashMap<Pubkey, usize> = mints.iter().enumerate().map(|(i, p)| (*p, i)).collect();
 
+        // multiple pools can connect the same pair (e.g. two raydium pools for the same mints).
+        // keep only the best-rate edge per (u, v), that's the one bellman-ford would actually pick,
+        // and it keeps the pred[] walk unambiguous during cycle reconstruction below.
+        let mut best_edge: HashMap<(usize, usize), &ArbEdge> = HashMap::new();
+        for e in edges {
+            let (u, v) = (idx[&e.from_mint], idx[&e.to_mint]);
+            let w = -(e.rate.max(1e-15).ln());
+            best_edge.entry((u, v))
+                .and_modify(|cur| if w < -(cur.rate.max(1e-15).ln()) { *cur = e })
+                .or_insert(e);
+        }
+
         let mut dist = vec![f64::INFINITY; n];
         let mut pred: Vec<Option<usize>> = vec![None; n];
         let start = idx.get(&self.sol_mint).copied().unwrap_or(0);
         dist[start] = 0.0;
 
         for _ in 0..n.saturating_sub(1) {
-            for e in edges {
-                let (u, v, w) = (idx[&e.from_mint], idx[&e.to_mint], -(e.rate.max(1e-15).ln()));
+            for (&(u, v), e) in &best_edge {
+                if dist[u].is_infinite() { continue; }
+                let w = -(e.rate.max(1e-15).ln());
                 if dist[u] + w < dist[v] {
                     dist[v] = dist[u] + w;
                     pred[v] = Some(u);
@@ -103,17 +116,68 @@ impl ArbitrageScanner {
             }
         }
 
-        // find nodes that still relax on the nth pass — those are in negative cycles
-        let neg_nodes: Vec<usize> = edges.iter().filter_map(|e| {
-            let (u, v, w) = (idx[&e.from_mint], idx[&e.to_mint], -(e.rate.max(1e-15).ln()));
-            if dist[u] + w < dist[v] { Some(v) } else { None }
-        }).collect();
+        // nth pass: anything that still relaxes is inside (or downstream of) a negative cycle.
+        // TODO: this grabs the first one it finds and stops. there can be several live negative
+        //       cycles at once on a busy graph, worth returning all of them eventually, but one
+        //       profitable route per scan is enough for now and keeps this simple.
+        let mut relaxed_node = None;
+        for (&(u, v), e) in &best_edge {
+            if dist[u].is_infinite() { continue; }
+            let w = -(e.rate.max(1e-15).ln());
+            if dist[u] + w < dist[v] - 1e-12 {
+                pred[v] = Some(u);
+                relaxed_node = Some(v);
+                break;
+            }
+        }
 
-        // TODO: implement proper cycle reconstruction — walk pred[] back n steps then
-        //       trace the loop. it's annoying but necessary for multi-hop paths beyond SOL→X→Y→SOL.
-        //       for now this returns nothing and we only catch the obvious 2-hop cases above.
-        let _ = (neg_nodes, pred); // suppress unused warnings
-        vec![]
+        let Some(mut node) = relaxed_node else { return vec![] };
+
+        // walk back n steps first, guarantees we land *inside* the cycle instead of somewhere
+        // upstream of it that merely feeds into it.
+        for _ in 0..n {
+            node = match pred[node] {
+                Some(p) => p,
+                None => return vec![],
+            };
+        }
+
+        // now trace the actual loop back to itself
+        let cycle_head = node;
+        let mut nodes = vec![cycle_head];
+        let mut cur = match pred[cycle_head] { Some(p) => p, None => return vec![] };
+        let mut guard = 0;
+        while cur != cycle_head {
+            nodes.push(cur);
+            cur = match pred[cur] { Some(p) => p, None => return vec![] };
+            guard += 1;
+            if guard > n { return vec![]; } // defensive, shouldn't happen if pred[] is a real cycle
+        }
+        // pred[] points backward, so the collected order is reversed relative to actual swap order
+        nodes.reverse();
+
+        // stitch node indices back into the real edges (and pools) that connect them
+        let mut cycle_edges = Vec::with_capacity(nodes.len());
+        for w in nodes.windows(2) {
+            match best_edge.get(&(w[0], w[1])) {
+                Some(e) => cycle_edges.push((*e).clone()),
+                None => return vec![],
+            }
+        }
+        let (last, first) = (*nodes.last().unwrap(), nodes[0]);
+        match best_edge.get(&(last, first)) {
+            Some(e) => cycle_edges.push((*e).clone()),
+            None => return vec![],
+        }
+
+        // rotate so the cycle starts at sol_mint, we can only actually fund the arb with
+        // a currency we hold, a cycle that never touches it isn't executable today.
+        let Some(rotate_at) = cycle_edges.iter().position(|e| e.from_mint == self.sol_mint) else {
+            return vec![]; // valid negative cycle, but doesn't route through anything we hold
+        };
+        cycle_edges.rotate_left(rotate_at);
+
+        vec![cycle_edges]
     }
 
     fn evaluate_cycle(&self, cycle: Vec<ArbEdge>) -> Option<ArbPath> {
