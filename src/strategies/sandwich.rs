@@ -11,7 +11,7 @@ use crate::smart_money::SmartMoneyClassifier;
 use crate::state::{PoolState, POOLS};
 
 // 50bps minimum slippage tolerance on the victim. anything tighter and
-// you're playing with fire the frontrun will push them past min_amount_out.
+// you're playing with fire, the frontrun will push them past min_amount_out.
 const MIN_VICTIM_SLIP_BPS: u16   = 50;
 const MAX_POOL_IMPACT_BPS: u16   = 200;  // don't nuke the pool, 2% is already aggressive
 const MAX_VICTIM_IMPACT_BPS: u16 = 100;  // if the victim is moving price 1%+ they're probably not retail
@@ -110,7 +110,7 @@ impl SandwichDetector {
     }
 
     // binary search the largest frontrun that won't revert the victim.
-    // this is the ugly but it flies approach no closed form, just bisect.
+    // this is the ugly but it flies approach, no closed form, just bisect.
     fn optimal_frontrun_size(&self, pool: &PoolState, swap: &PendingSwap, max: u64) -> Option<u64> {
         let (mut lo, mut hi) = (FRONTRUN_FLOOR, max);
         if lo > hi { return None; }
