@@ -1,5 +1,5 @@
 // toxic flow filter. classifies wallets that are likely informed / arb bots.
-// we don't want to sandwich these — they'll eat us alive.
+// we don't want to sandwich these, they'll eat us alive.
 //
 // scoring is multi-signal: success rate, cross-pool activity, CU usage, timing, arb program hits.
 // thresholds are hand-tuned on historical data. don't change them without backtesting.
@@ -147,7 +147,7 @@ impl SmartMoneyClassifier {
             .filter(|p| !p.is_stale() && p.tx_count >= MIN_OBS)
             .map(|p| (p.address, p.score()))
             .collect();
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(n);
         scored
     }
