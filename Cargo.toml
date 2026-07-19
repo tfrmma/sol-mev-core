@@ -13,16 +13,11 @@ tokio-stream = "0.1"
 
 solana-client             = "1.18"
 solana-sdk                = "1.18"
-solana-transaction-status = "1.18"
-solana-account-decoder    = "1.18"
 solana-program            = "1.18"
-spl-token                    = { version = "4.0", features = ["no-entrypoint"] }
-spl-associated-token-account = { version = "2.3", features = ["no-entrypoint"] }
 
-yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc", branch = "master" }
-yellowstone-grpc-proto  = { git = "https://github.com/rpcpool/yellowstone-grpc", branch = "master" }
-tonic = { version = "0.11", features = ["tls", "tls-roots"] }
-prost = "0.12"
+yellowstone-grpc-client = "13.2"
+yellowstone-grpc-proto  = "12.5"
+tonic = "0.14.6"
 
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 
@@ -39,6 +34,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dashmap           = "5"
 parking_lot       = "0.12"
 crossbeam-channel = "0.5"
+crossbeam-utils    = "0.8"
 
 uint         = "0.9"
 rust_decimal = { version = "1", features = ["maths"] }
@@ -52,6 +48,10 @@ futures   = "0.3"
 once_cell = "1"
 rand      = "0.8"
 ahash     = "0.8"
+
+[patch.crates-io]
+curve25519-dalek = { git = "https://github.com/solana-labs/curve25519-dalek", rev = "b500cdc2a920cd5bff9e2dd974d7b97349d61464" }
+
 
 [profile.release]
 opt-level     = 3
