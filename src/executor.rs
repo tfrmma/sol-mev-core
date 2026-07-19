@@ -1,5 +1,5 @@
 // takes a trading signal, builds ixs, sims, sets compute budget, fires off a jito bundle.
-// each strategy has its own ix builder. they're all stubs right now except the skeleton — 
+// each strategy has its own ix builder. they're all stubs right now except the skeleton, 
 // real account metas need to be plumbed through from registry.
 use anyhow::{Context, Result};
 use solana_client::nonblocking::rpc_client::RpcClient;
@@ -107,7 +107,7 @@ impl Executor {
         let sim = self.simulator.simulate(&self.signer, ixs.clone()).await?;
         if !sim.success {
             warn!("preflight failed: {:?}", sim.error);
-            return Err(anyhow::anyhow!("simulation failed — aborting"));
+            return Err(anyhow::anyhow!("simulation failed, aborting"));
         }
 
         // deduplicate accounts for priority fee query
