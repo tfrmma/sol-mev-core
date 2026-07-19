@@ -1,5 +1,5 @@
 // EWMA volatility + circuit breaker + profit adjustment for liquidations.
-// nothing fancy — RiskMetrics-style, lambda=0.94 because that's what everyone uses
+// nothing fancy, RiskMetrics-style, lambda=0.94 because that's what everyone uses
 // and it works well enough on crypto (high kurtosis be damned).
 use solana_sdk::pubkey::Pubkey;
 use std::{
