@@ -75,13 +75,6 @@ impl Executor {
     async fn execute_sandwich(&self, opp: SandwichOpportunity) -> Result<()> {
         info!("sandwich: victim={} profit={}", opp.victim_sig, opp.estimated_profit);
         let pool = &opp.pool_state;
-//! @file executor.rs
-//! @author Taha - Algorithmic Trader
-//! @brief Institutional-grade sol-mev-core
-//! 
-//! @note This is a public structural showcase. For full production-grade 
-//!       deployment, architecture consulting, or recruitment inquiries:
-//!       Contact: email: fadilrezokt@gmail.com / linkedin.com/in/tahaotc
         // 1% slippage tolerance on the frontrun output. don't be too tight or we revert.
         let front_ix = self.swap_ix(
             pool.pool_id, &pool.dex, pool.token_a_mint, pool.token_b_mint,
