@@ -4,7 +4,7 @@
 //
 // FILTERING STRATEGY:
 //   1. server-side: geyser `owner` filter drops everything not owned by our program IDs.
-//      this is free — the validator does it before the packet hits the network.
+//      this is free, the validator does it before the packet hits the network.
 //   2. client-side first gate: check account data length before touching any offsets.
 //   3. discriminant check: first 8 bytes must match the expected account type.
 //      bails out before any field parsing on garbage/unrelated accounts.
@@ -29,19 +29,27 @@ use crate::{
     state::{Dex, LendingProtocol, ObligationState, PoolState, CURRENT_SLOT, OBLIGATIONS, POOLS},
 };
 
-// program IDs — keep in sync with registry.rs defaults
+// program IDs, keep in sync with registry.rs defaults
 const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 const ORCA_SWAP_V2:   &str = "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP";
 const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const KAMINO_LENDING: &str = "KLend2g3cP87fffoy8q1mQqGKjrL1AyGGFsDGJr5J6Z";
 const SOLEND_PROGRAM: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
 
-// Raydium AMM v4 account discriminant — first 8 bytes of the on-chain layout.
+// parsed once at startup, account updates come in fast enough that we don't want
+// to allocate a String and compare text for every single one.
+static RAYDIUM_AMM_V4_PK: once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| RAYDIUM_AMM_V4.parse().unwrap());
+static ORCA_SWAP_V2_PK:   once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| ORCA_SWAP_V2.parse().unwrap());
+static ORCA_WHIRLPOOL_PK: once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| ORCA_WHIRLPOOL.parse().unwrap());
+static KAMINO_LENDING_PK: once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| KAMINO_LENDING.parse().unwrap());
+static SOLEND_PROGRAM_PK: once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| SOLEND_PROGRAM.parse().unwrap());
+
+// Raydium AMM v4 account discriminant, first 8 bytes of the on-chain layout.
 // verify with: solana account <pool> --output json | head. if this changes, raydium redeployed.
 const RAYDIUM_POOL_DISC: [u8; 8] = [0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00];
 // Kamino obligation anchor discriminant (sha256("account:Obligation")[..8])
 const KAMINO_OBLIGATION_DISC: [u8; 8] = [0xca, 0x5d, 0x0c, 0x6b, 0x7e, 0x3d, 0x41, 0x72];
-// minimum sane data sizes — saves us from indexing into garbage buffers
+// minimum sane data sizes, saves us from indexing into garbage buffers
 const RAYDIUM_POOL_MIN_LEN: usize  = 0x1A0;
 const OBLIGATION_MIN_LEN:   usize  = 200;
 
@@ -103,8 +111,8 @@ impl Monitor {
         info!("connecting to geyser {}", self.endpoint);
         loop {
             match self.stream_loop().await {
-                Ok(_)  => info!("geyser stream closed — reconnecting"),
-                Err(e) => warn!("geyser error: {e} — reconnecting in 500ms"),
+                Ok(_)  => info!("geyser stream closed, reconnecting"),
+                Err(e) => warn!("geyser error: {e}, reconnecting in 500ms"),
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
@@ -126,7 +134,7 @@ impl Monitor {
             ]);
 
         // server-side filter: only accounts owned by our AMM/lending programs.
-        // this is the biggest lever — geyser drops the rest before sending anything over gRPC.
+        // this is the biggest lever, geyser drops the rest before sending anything over gRPC.
         //
         // NOTE: memcmp discriminant filters (offset=0, 8-byte match) would further reduce
         // traffic but the exact proto path varies between yellowstone-grpc versions.
@@ -259,23 +267,20 @@ impl Monitor {
 }
 
 fn is_amm_owner(owner: &Pubkey) -> bool {
-    let s = owner.to_string();
-    s == RAYDIUM_AMM_V4 || s == ORCA_SWAP_V2 || s == ORCA_WHIRLPOOL
+    owner == &*RAYDIUM_AMM_V4_PK || owner == &*ORCA_SWAP_V2_PK || owner == &*ORCA_WHIRLPOOL_PK
 }
 
 fn is_lending_owner(owner: &Pubkey) -> bool {
-    let s = owner.to_string();
-    s == KAMINO_LENDING || s == SOLEND_PROGRAM
+    owner == &*KAMINO_LENDING_PK || owner == &*SOLEND_PROGRAM_PK
 }
 
-// unified pool decoder — dispatches by owner program.
+// unified pool decoder, dispatches by owner program.
 // discriminant check is the first thing we do. cheap comparison before touching any field offsets.
 fn decode_pool(pubkey: Pubkey, owner: &Pubkey, data: &[u8], slot: u64) -> Option<PoolState> {
-    let owner_str = owner.to_string();
-    if owner_str == RAYDIUM_AMM_V4 {
+    if owner == &*RAYDIUM_AMM_V4_PK {
         decode_raydium_pool(pubkey, data, slot)
     } else {
-        // orca/whirlpool: TODO — layout differs per pool version.
+        // orca/whirlpool: TODO, layout differs per pool version.
         // at minimum check discriminant before returning None to avoid log spam.
         None
     }
@@ -283,7 +288,7 @@ fn decode_pool(pubkey: Pubkey, owner: &Pubkey, data: &[u8], slot: u64) -> Option
 
 // hardcoded raydium AMM v4 layout. offsets verified against on-chain IDL, not the docs.
 fn decode_raydium_pool(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<PoolState> {
-    // discriminant check first — bails before any offset math on wrong account types.
+    // discriminant check first, bails before any offset math on wrong account types.
     // this catches fee collector accounts, config accounts, etc that pass the owner filter.
     if data.len() < RAYDIUM_POOL_MIN_LEN { return None; }
     if data[..8] != RAYDIUM_POOL_DISC    { return None; }
@@ -293,7 +298,7 @@ fn decode_raydium_pool(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<PoolSta
     let reserve_a = u64::from_le_bytes(data[0x190..0x198].try_into().ok()?);
     let reserve_b = u64::from_le_bytes(data[0x198..0x1A0].try_into().ok()?);
 
-    // skip pools with zero reserves — nothing to trade against and they'll spew NaN into the arb graph
+    // skip pools with zero reserves, nothing to trade against and they'll spew NaN into the arb graph
     if reserve_a == 0 || reserve_b == 0 { return None; }
 
     Some(PoolState {
@@ -303,13 +308,13 @@ fn decode_raydium_pool(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<PoolSta
     })
 }
 
-// minimal obligation decode. collateral/borrow at fixed offsets — works for kamino v1 and solend.
+// minimal obligation decode. collateral/borrow at fixed offsets, works for kamino v1 and solend.
 // marginfi has a different layout; add it when we actually need it.
 fn decode_obligation(pubkey: Pubkey, program: &Pubkey, data: &[u8], slot: u64) -> Option<ObligationState> {
     if data.len() < OBLIGATION_MIN_LEN { return None; }
 
     // kamino uses anchor discriminants; check before parsing fields
-    let protocol = if program.to_string() == KAMINO_LENDING {
+    let protocol = if program == &*KAMINO_LENDING_PK {
         if data[..8] != KAMINO_OBLIGATION_DISC { return None; }
         LendingProtocol::Kamino
     } else {
