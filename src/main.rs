@@ -99,12 +99,12 @@ async fn main() -> Result<()> {
         });
     }
 
-    // executor: signal → jito bundle (+ rpc spam if configured)
+    // executor: signal -> jito bundle (+ rpc spam if configured)
     {
-        let (cfg, sim) = (config.clone(), simulator.clone());
+        let (cfg, sim, reg) = (config.clone(), simulator.clone(), registry.clone());
         tokio::spawn(async move {
             let signer   = cfg.load_keypair().expect("keypair");
-            let executor = Executor::new(cfg, signer, sim);
+            let executor = Executor::new(cfg, signer, sim, reg);
             while let Some(sig) = sig_rx.recv().await {
                 if let Err(e) = executor.execute(sig).await { error!("executor: {e:#}"); }
             }
