@@ -20,7 +20,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 // verified against https://jito-labs.gitbook.io/mev/searcher-resources/tip-payment-program
-// do NOT use your own address you won't get tip routing and the validator won't prioritize you
+// do NOT use your own address, you won't get tip routing and the validator won't prioritize you
 const TIP_ACCOUNTS: &[&str] = &[
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5",
     "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
@@ -76,7 +76,7 @@ impl JitoBundle {
     }
 
     // encode just the primary tx (not the tip) for raw RPC spam.
-    // the tip ix is jito-only no point sending it to vanilla validators.
+    // the tip ix is jito-only, no point sending it to vanilla validators.
     pub fn encode_primary(&self) -> Option<String> {
         self.transactions.first()
             .map(|tx| B64.encode(bincode::serialize(tx).expect("tx serialize")))
@@ -92,7 +92,7 @@ pub struct JitoClient {
 impl JitoClient {
     pub fn new(endpoint: &str, _max_retries: u32) -> Self {
         // _max_retries kept in signature for API compat but ignored.
-        // slot-bound opportunities don't retry stale = dead.
+        // slot-bound opportunities don't retry, stale = dead.
         let http = Client::builder()
             .timeout(Duration::from_millis(400))
             .build()
@@ -113,7 +113,7 @@ impl JitoClient {
         self
     }
 
-    // fire jito bundle + raw RPC spam simultaneously. no retries if it misses, it misses.
+    // fire jito bundle + raw RPC spam simultaneously. no retries, if it misses, it misses.
     // returns the jito bundle UUID if the bundle was accepted (spam is fire-and-forget).
     pub async fn send_bundle(&self, bundle: &JitoBundle) -> Result<String> {
         let payload = RpcRequest {
@@ -124,7 +124,7 @@ impl JitoClient {
         debug!("firing bundle: {} txs + {} spam endpoints",
                bundle.transactions.len(), self.spam_clients.len());
 
-        // kick off RPC spam in the background don't await, don't care about errors
+        // kick off RPC spam in the background, don't await, don't care about errors
         if let Some(encoded) = bundle.encode_primary() {
             for (client, url) in &self.spam_clients {
                 let c    = client.clone();
@@ -142,7 +142,7 @@ impl JitoClient {
             }
         }
 
-        // jito submission single attempt, no sleep, no retry loop
+        // jito submission, single attempt, no sleep, no retry loop
         match self.try_send(&payload).await {
             Ok(uuid) => {
                 info!("bundle accepted uuid={uuid}");
