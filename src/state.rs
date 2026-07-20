@@ -110,6 +110,18 @@ pub enum Dex { Raydium, Orca, OrcaWhirlpool, Lifinity, Meteora }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LendingProtocol { Kamino, Solend, MarginFi }
 
+// concentrated liquidity pool state, sqrt_price and liquidity as tracked on-chain.
+// sqrt_price is Q64.64 fixed point, verified against orca-so/whirlpools state/whirlpool.rs.
+#[derive(Debug, Clone)]
+pub struct ClmmState {
+    pub sqrt_price:  u128, // Q64.64
+    pub liquidity:   u128,
+    pub tick_current: i32,
+    pub tick_spacing: u16,
+}
+
+const Q64: u128 = 1u128 << 64;
+
 #[derive(Debug, Clone)]
 pub struct PoolState {
     pub pool_id:      Pubkey,
@@ -120,6 +132,9 @@ pub struct PoolState {
     pub reserve_b:    u64,
     pub fee_bps:      u16,
     pub slot:         u64,
+    // Some() for CLMM dexes (whirlpool), None for constant-product ones (raydium, orca legacy).
+    // reserve_a/reserve_b are left at 0 for CLMM pools, don't use them, use clmm instead.
+    pub clmm:         Option<ClmmState>,
 }
 
 impl HasSlot for PoolState      { fn slot(&self) -> u64 { self.slot } }
@@ -128,6 +143,11 @@ impl HasSlot for ObligationState { fn slot(&self) -> u64 { self.slot } }
 impl PoolState {
     #[inline(always)]
     pub fn price_a_in_b(&self) -> Option<f64> {
+        if let Some(c) = &self.clmm {
+            // price = (sqrt_price / 2^64)^2, how many B per 1 A. exact, no approximation here.
+            let sp = c.sqrt_price as f64 / Q64 as f64;
+            return Some(sp * sp);
+        }
         if self.reserve_a == 0 { return None; }
         Some(self.reserve_b as f64 / self.reserve_a as f64)
     }
@@ -135,6 +155,7 @@ impl PoolState {
     // constant product. boring but correct. don't try to be clever here.
     #[inline(always)]
     pub fn quote_a_to_b(&self, amount_in: u64) -> u64 {
+        if let Some(c) = &self.clmm { return self.quote_clmm(c, amount_in, true); }
         let fee_num     = 10_000u128 - self.fee_bps as u128;
         let in_with_fee = amount_in as u128 * fee_num;
         let num         = in_with_fee * self.reserve_b as u128;
@@ -145,12 +166,55 @@ impl PoolState {
 
     #[inline(always)]
     pub fn quote_b_to_a(&self, amount_in: u64) -> u64 {
+        if let Some(c) = &self.clmm { return self.quote_clmm(c, amount_in, false); }
         let fee_num     = 10_000u128 - self.fee_bps as u128;
         let in_with_fee = amount_in as u128 * fee_num;
         let num         = in_with_fee * self.reserve_a as u128;
         let den         = (self.reserve_b as u128 * 10_000) + in_with_fee;
         if den == 0 { return 0; }
         (num / den) as u64
+    }
+
+    // single-tick-range swap quote (no tick crossing), CLMM math verified against
+    // orca-so/whirlpools/programs/whirlpool/src/math/{token_math,swap_math}.rs.
+    //
+    // IMPORTANT CAVEAT: this only holds while the swap stays within the pool's currently
+    // active tick range. once the trade is big enough to cross into the next initialized
+    // tick, real liquidity changes and this formula silently undercounts slippage, i.e. it
+    // will quote a BETTER output than you'd actually get on-chain. fine for opportunity
+    // scanning on reasonably-sized trades, not safe yet for sizing large trades via the
+    // binary search in arbitrage.rs without a size cap. needs real tick-array walking and
+    // unit tests against known pool snapshots before this is fully trustworthy, tracked
+    // as a follow-up.
+    fn quote_clmm(&self, c: &ClmmState, amount_in: u64, a_to_b: bool) -> u64 {
+        if c.liquidity == 0 || c.sqrt_price == 0 { return 0; }
+        let fee_num     = 10_000u128 - self.fee_bps as u128;
+        let in_with_fee = (amount_in as u128 * fee_num) / 10_000;
+        if in_with_fee == 0 { return 0; }
+
+        if a_to_b {
+            // adding token A moves price down. Δ(sqrt_price) via token0-style delta:
+            // new_sqrt_price = L * sqrt_price / (L + amount_in * sqrt_price / 2^64)
+            let Some(product) = in_with_fee.checked_mul(c.sqrt_price) else { return 0 };
+            let denom = c.liquidity + (product / Q64);
+            if denom == 0 { return 0; }
+            let Some(num) = c.liquidity.checked_mul(c.sqrt_price) else { return 0 };
+            let new_sqrt_price = num / denom;
+            if new_sqrt_price >= c.sqrt_price { return 0; } // no movement, or overflowed into garbage
+            // amount_out (token B) = L * (sqrt_price - new_sqrt_price) / 2^64
+            let Some(delta) = c.liquidity.checked_mul(c.sqrt_price - new_sqrt_price) else { return 0 };
+            (delta / Q64).min(u64::MAX as u128) as u64
+        } else {
+            // adding token B moves price up linearly: new_sqrt_price = sqrt_price + amount*2^64/L
+            let Some(scaled) = in_with_fee.checked_mul(Q64) else { return 0 };
+            let new_sqrt_price = c.sqrt_price + (scaled / c.liquidity);
+            // amount_out (token A) = L * (new_sqrt_price - sqrt_price) / (sqrt_price * new_sqrt_price) * 2^64
+            let Some(num) = c.liquidity.checked_mul(new_sqrt_price - c.sqrt_price) else { return 0 };
+            let Some(num) = num.checked_mul(Q64) else { return 0 };
+            let Some(den) = c.sqrt_price.checked_mul(new_sqrt_price) else { return 0 };
+            if den == 0 { return 0; }
+            (num / den).min(u64::MAX as u128) as u64
+        }
     }
 
     #[inline(always)]
