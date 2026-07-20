@@ -96,11 +96,11 @@ impl Executor {
         let pool = &opp.pool_state;
         // 1% slippage tolerance on the frontrun output. don't be too tight or we revert.
         let front_ix = self.swap_ix(
-            pool.pool_id, &pool.dex, pool.token_a_mint, pool.token_b_mint,
+            pool, pool.token_a_mint, pool.token_b_mint,
             opp.frontrun_amount, opp.frontrun_output * 990 / 1000,
         )?;
         let back_ix = self.swap_ix(
-            pool.pool_id, &pool.dex, pool.token_b_mint, pool.token_a_mint,
+            pool, pool.token_b_mint, pool.token_a_mint,
             opp.frontrun_output, opp.frontrun_amount,
         )?;
 
@@ -171,7 +171,7 @@ impl Executor {
             };
             let min_out = (expected * 995 / 1000).max(1);
             ixs.push(self.swap_ix(
-                edge.pool_state.pool_id, &edge.pool_state.dex,
+                &edge.pool_state,
                 edge.from_mint, edge.to_mint, amount, min_out,
             )?);
             amount = expected;
@@ -179,15 +179,15 @@ impl Executor {
         Ok(ixs)
     }
 
-    fn swap_ix(&self, pool: Pubkey, dex: &Dex, input: Pubkey, output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
-        let meta = self.registry.pool_meta(&pool)
-            .with_context(|| format!("no registry entry for pool {pool}, can't build accounts"))?;
-        match dex {
+    fn swap_ix(&self, pool: &PoolState, input: Pubkey, output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
+        let meta = self.registry.pool_meta(&pool.pool_id)
+            .with_context(|| format!("no registry entry for pool {}, can't build accounts", pool.pool_id))?;
+        match &pool.dex {
             Dex::Raydium       => self.raydium_ix(&meta, input, output, amount_in, min_out),
             Dex::Orca          => self.orca_ix(&meta, input, output, amount_in, min_out),
-            Dex::OrcaWhirlpool => self.whirlpool_ix(&meta, input, output, amount_in, min_out),
+            Dex::OrcaWhirlpool => self.whirlpool_ix(&meta, pool, input, output, amount_in, min_out),
             // TODO: Lifinity and Meteora. meteora is a pain because of the dynamic fee model.
-            _                  => Err(anyhow::anyhow!("{dex:?} not implemented")),
+            dex                => Err(anyhow::anyhow!("{dex:?} not implemented")),
         }
     }
 
@@ -231,11 +231,80 @@ impl Executor {
         Err(anyhow::anyhow!("orca ix builder not implemented yet, see TODO(#4)"))
     }
 
-    // TODO(#4): whirlpool needs tick array accounts computed from the pool's current tick index
-    //           and tick spacing, which decode_pool() doesn't extract yet (monitor.rs only handles
-    //           raydium today). building this ix before that lands means guessing tick arrays,
-    //           which just fails on-chain. blocked on the whirlpool decoder, not on this function.
-    fn whirlpool_ix(&self, _meta: &PoolMeta, _input: Pubkey, _output: Pubkey, _amount_in: u64, _min_out: u64) -> Result<Instruction> {
-        Err(anyhow::anyhow!("whirlpool ix builder blocked on whirlpool pool decoding, see TODO(#4)"))
+    // whirlpool swap, verified against orca-so/whirlpools/programs/whirlpool/src/instructions/swap.rs
+    // (main branch). 11 accounts, discriminator computed as sha256("global:swap")[..8] rather than
+    // copied from memory, since that's the one part of an anchor ix nobody should be typing by hand.
+    //
+    // single caveat carried over from quote_clmm in state.rs: this only walks the tick arrays that
+    // contain the pool's *current* tick. if the trade is big enough to cross into the next array,
+    // the swap will still succeed on-chain (the program crosses ticks correctly, it doesn't need our
+    // help there) but our quote_a_to_b sizing upstream in arbitrage.rs was computed assuming no
+    // crossing, so on a big trade the real output may come in worse than what we sized against.
+    fn whirlpool_ix(&self, meta: &PoolMeta, pool: &PoolState, input: Pubkey, output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
+        let clmm = pool.clmm.as_ref().context("whirlpool pool_state missing clmm data, decode didn't run?")?;
+        let program_id = meta.program_pubkey().context("bad program_id in registry")?;
+        let whirlpool   = meta.pool_pubkey().context("bad pool_id in registry")?;
+        let vault_a     = meta.vault_a_pk().context("bad token_a_vault in registry")?;
+        let vault_b     = meta.vault_b_pk().context("bad token_b_vault in registry")?;
+        let mint_a      = meta.token_a_mint_pk().context("bad token_a_mint in registry")?;
+        let mint_b      = meta.token_b_mint_pk().context("bad token_b_mint in registry")?;
+        let token_program: Pubkey = SPL_TOKEN_PROGRAM_ID.parse()?;
+        let owner = self.signer.pubkey();
+        let a_to_b = input == mint_a;
+
+        // three tick arrays around the current tick, seeds verified against
+        // instructions/initialize_tick_array.rs: [b"tick_array", whirlpool, start_tick.to_string()].
+        // note the seed is the ascii decimal string of the tick, not raw bytes, an orca quirk.
+        const TICK_ARRAY_SIZE: i32 = 88;
+        let ticks_per_array = TICK_ARRAY_SIZE * clmm.tick_spacing as i32;
+        let base_start = clmm.tick_current.div_euclid(ticks_per_array) * ticks_per_array;
+        let tick_array_pda = |start: i32| -> Result<Pubkey> {
+            let seeds = [b"tick_array".as_ref(), whirlpool.as_ref(), start.to_string().as_bytes()];
+            Ok(Pubkey::find_program_address(&seeds, &program_id).0)
+        };
+        // walk outward in the swap direction, same convention the SDK uses for tick_array_1/2.
+        let (start_1, start_2) = if a_to_b {
+            (base_start - ticks_per_array, base_start - 2 * ticks_per_array)
+        } else {
+            (base_start + ticks_per_array, base_start + 2 * ticks_per_array)
+        };
+        let tick_array_0 = tick_array_pda(base_start)?;
+        let tick_array_1 = tick_array_pda(start_1)?;
+        let tick_array_2 = tick_array_pda(start_2)?;
+
+        let oracle_seeds = [b"oracle".as_ref(), whirlpool.as_ref()];
+        let oracle = Pubkey::find_program_address(&oracle_seeds, &program_id).0;
+
+        // bounds verified against orca-so/whirlpools/programs/whirlpool/src/math/tick_math.rs.
+        // passing 0 here isn't "no limit", it's out of bounds and the program rejects it outright.
+        const MIN_SQRT_PRICE_X64: u128 = 4_295_048_016;
+        const MAX_SQRT_PRICE_X64: u128 = 79_226_673_515_401_279_992_447_579_055;
+        let sqrt_price_limit = if a_to_b { MIN_SQRT_PRICE_X64 } else { MAX_SQRT_PRICE_X64 };
+
+        const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
+        let mut data = SWAP_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_out.to_le_bytes());
+        data.extend_from_slice(&sqrt_price_limit.to_le_bytes());
+        data.push(1); // amount_specified_is_input: true, amount_in is exact
+        data.push(a_to_b as u8);
+
+        let accounts = vec![
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(whirlpool, false),
+            AccountMeta::new(derive_ata(&owner, &mint_a)?, false),
+            AccountMeta::new(vault_a, false),
+            AccountMeta::new(derive_ata(&owner, &mint_b)?, false),
+            AccountMeta::new(vault_b, false),
+            AccountMeta::new(tick_array_0, false),
+            AccountMeta::new(tick_array_1, false),
+            AccountMeta::new(tick_array_2, false),
+            AccountMeta::new_readonly(oracle, false),
+        ];
+
+        let _ = output; // direction comes from a_to_b / meta.token_a_mint, not from comparing to `output`
+
+        Ok(Instruction { program_id, accounts, data })
     }
 }
