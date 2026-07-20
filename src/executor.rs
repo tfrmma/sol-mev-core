@@ -20,7 +20,7 @@ use crate::{
     jito::{JitoBundle, JitoClient},
     registry::{PoolMeta, Registry},
     simulator::Simulator,
-    state::Dex,
+    state::{Dex, PoolState},
     strategies::{
         arbitrage::ArbPath,
         liquidation::LiqOpportunity,
@@ -271,7 +271,7 @@ impl Executor {
         let vault_a     = meta.vault_a_pk().context("bad token_a_vault in registry")?;
         let vault_b     = meta.vault_b_pk().context("bad token_b_vault in registry")?;
         let mint_a      = meta.token_a_mint_pk().context("bad token_a_mint in registry")?;
-        let mint_b      = meta.token_b_mint_pk().context("bad token_b_mint in registry")?;
+        let _mint_b     = meta.token_b_mint_pk().context("bad token_b_mint in registry")?; // validated, not otherwise needed here
         let extra = meta.extra_pubkeys();
         let pool_mint = *extra.first().context("orca legacy pool missing extra_accounts[0]=pool_mint")?;
         let pool_fee  = *extra.get(1).context("orca legacy pool missing extra_accounts[1]=pool_fee_account")?;
