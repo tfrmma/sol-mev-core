@@ -92,7 +92,7 @@ impl RegistryFile {
                 prog("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8", "Raydium AMM v4",  ProgramKind::AmmRaydium,       4),
                 prog("9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP", "Orca Swap v2",    ProgramKind::AmmOrca,          2),
                 prog("whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc",  "Orca Whirlpool",  ProgramKind::AmmOrcaWhirlpool, 1),
-                prog("KLend2g3cP87fffoy8q1mQqGKjrL1AyGGFsDGJr5J6Z",  "Kamino Lending",  ProgramKind::LendingKamino,    1),
+                prog("KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD",  "Kamino Lending",  ProgramKind::LendingKamino,    1),
                 prog("So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo",  "Solend",          ProgramKind::LendingSolend,    1),
                 prog("MFv2hWf31Z9kbCa1snEPdcgp7MkGkgy5oBR3uW1CiAX",  "MarginFi",        ProgramKind::LendingMarginFi,  1),
             ],
