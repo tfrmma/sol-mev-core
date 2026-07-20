@@ -52,7 +52,9 @@ pub struct PoolMeta {
     pub token_a_vault:  String,
     pub token_b_vault:  String,
     pub fee_bps:        u16,
-    pub extra_accounts: Vec<String>, // program-specific remaining accounts (oracles, etc)
+    // program-specific remaining accounts. convention by dex:
+    //   orca legacy (token-swap): [0]=pool_mint, [1]=pool_fee_account
+    pub extra_accounts: Vec<String>,
     pub dex:            ProgramKind,
 }
 
