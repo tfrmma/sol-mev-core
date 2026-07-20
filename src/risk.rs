@@ -127,3 +127,77 @@ impl RiskEngine {
             .update(price);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::Dex;
+
+    fn pool(reserve_a: u64, reserve_b: u64) -> PoolState {
+        PoolState {
+            pool_id: Pubkey::default(), dex: Dex::Raydium,
+            token_a_mint: Pubkey::default(), token_b_mint: Pubkey::default(),
+            reserve_a, reserve_b, fee_bps: 25, slot: 0, clmm: None,
+        }
+    }
+
+    #[test]
+    fn exit_slippage_zero_reserve_is_total_loss() {
+        let p = pool(0, 1_000);
+        assert_eq!(exit_slippage(&p, 100, true), 1.0);
+    }
+
+    #[test]
+    fn exit_slippage_scales_with_size_and_safety_mult() {
+        let p = pool(1_000_000, 1_000_000);
+        // 1000 / (1_000_000 + 1000) * 1.5, small trade against deep liquidity should be tiny
+        let small = exit_slippage(&p, 1_000, true);
+        let large = exit_slippage(&p, 500_000, true);
+        assert!(small < large, "bigger trade should slip more");
+        assert!(small < 0.01, "1000 against a 1M pool shouldn't slip more than 1%, got {small}");
+    }
+
+    #[test]
+    fn asset_vol_sigma_starts_at_zero() {
+        let v = AssetVol::new(100.0);
+        assert_eq!(v.sigma(), 0.0, "no price history yet, no variance");
+    }
+
+    #[test]
+    fn asset_vol_sigma_rises_after_a_price_jump() {
+        let mut v = AssetVol::new(100.0);
+        v.update(150.0); // 50% jump, should register real variance
+        assert!(v.sigma() > 0.0, "sigma should be nonzero after a price move");
+    }
+
+    #[test]
+    fn asset_vol_ignores_nonpositive_prices() {
+        // a zero or negative price is bad data (decode bug, empty pool, whatever), not a real move.
+        // update() should just no-op instead of feeding ln(negative) or ln(0) into the EWMA.
+        let mut v = AssetVol::new(100.0);
+        v.update(0.0);
+        v.update(-5.0);
+        assert_eq!(v.sigma(), 0.0);
+        assert_eq!(v.last_price, 100.0);
+    }
+
+    #[test]
+    fn adjusted_profit_none_when_net_negative() {
+        let risk = RiskEngine::new();
+        let mint = Pubkey::new_unique();
+        let exit_pool = pool(1_000, 1_000); // tiny pool, exiting into it is expensive
+        // gross profit smaller than what fees + slippage will eat
+        let result = risk.adjusted_profit(1_000, mint, &exit_pool, 500, true);
+        assert!(result.is_none(), "should reject a trade where costs exceed gross profit");
+    }
+
+    #[test]
+    fn adjusted_profit_some_when_comfortably_net_positive() {
+        let risk = RiskEngine::new();
+        let mint = Pubkey::new_unique();
+        let exit_pool = pool(10_000_000_000, 10_000_000_000); // deep pool, minimal slippage
+        let result = risk.adjusted_profit(1_000_000_000, mint, &exit_pool, 1_000, true);
+        assert!(result.is_some(), "large gross profit against deep liquidity should clear costs");
+        assert!(result.unwrap() < 1_000_000_000, "adjusted profit should still be less than gross");
+    }
+}
