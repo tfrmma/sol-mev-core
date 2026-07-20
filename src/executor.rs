@@ -23,7 +23,7 @@ use crate::{
     state::Dex,
     strategies::{
         arbitrage::ArbPath,
-        liquidation::{LiqOpportunity, LiquidationScanner},
+        liquidation::LiqOpportunity,
         sandwich::SandwichOpportunity,
         TradingSignal,
     },
@@ -81,14 +81,47 @@ impl Executor {
 
     async fn execute_liquidation(&self, opp: LiqOpportunity) -> Result<()> {
         info!("liq: obligation={} profit={:?}", opp.obligation, opp.adjusted_profit_lamports);
-        // RiskEngine not needed for ix building here, pass a fresh no-op instance
-        let scanner = LiquidationScanner::new(
-            &self.config,
-            self.signer.pubkey(),
-            crate::risk::RiskEngine::new(),
-        );
-        let ix = scanner.build_kamino_liquidation_ix(&opp);
-        self.sim_and_send(vec![ix]).await
+
+        // BLOCKED, not wired up. real plan below, verified against sources, not guessed:
+        //
+        // 1. ObligationState (state.rs) only carries aggregated collateral_value/borrow_value,
+        //    it doesn't know WHICH reserves are involved. that's the actual gap, not this
+        //    function. Kamino's real on-chain layout (confirmed against Kamino's own docs,
+        //    mintlify.com/kamino-finance/klend/concepts/architecture):
+        //
+        //      pub struct Obligation {
+        //          pub tag: u64,
+        //          pub last_update: LastUpdate,
+        //          pub lending_market: Pubkey,
+        //          pub owner: Pubkey,
+        //          pub deposits: [ObligationCollateral; 8],  // deposit_reserve: Pubkey, deposited_amount: u64, market_value_sf: u128
+        //          pub borrows: [ObligationLiquidity; 5],    // borrow_reserve: Pubkey, borrowed_amount_sf: u128, ...
+        //          pub deposited_value_sf: u128,
+        //          pub borrow_factor_adjusted_debt_value_sf: u128,
+        //          // ... more health/liquidation fields
+        //      }
+        //
+        //    fixed-size arrays, not the dynamic Vec<> layout older forks (Port, Solend) use.
+        //    this also explains the overlapping-offset bug flagged in decode_obligation()
+        //    in monitor.rs: it was hand-decoding against the wrong shape entirely.
+        //
+        // 2. don't hand-roll these offsets either. klend-interface re-exports
+        //    `state::from_account_data` for zero-copy Obligation/Reserve parsing, confirmed
+        //    present in the crate (see Cargo.toml, already added). use that instead of
+        //    byte-offset math in monitor.rs.
+        //
+        // 3. once ObligationState carries real deposit_reserve/borrow_reserve pubkeys,
+        //    LiqOpportunity needs repay_reserve/withdraw_reserve: Pubkey fields (replacing
+        //    the current repay_mint/collateral_mint placeholders in liquidation.rs, which are
+        //    already marked FIXME/wrong), and this function becomes: fetch those reserves +
+        //    obligation via klend_interface::{ObligationContext, ReserveInfo}, then call
+        //    klend_interface::helpers::liquidate::liquidate(...) (signature already confirmed
+        //    against docs.rs, see git history of this function for the attempted wiring).
+        //
+        // the one piece I could NOT verify against source: ObligationInfo's exact constructor
+        // (helpers::info module). confirm that against `cargo doc --open -p klend-interface`
+        // before finishing step 3, don't guess the method name.
+        Err(anyhow::anyhow!("kamino liquidation ix not wired up yet, see plan in execute_liquidation"))
     }
 
     async fn execute_sandwich(&self, opp: SandwichOpportunity) -> Result<()> {
