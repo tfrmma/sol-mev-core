@@ -260,3 +260,99 @@ pub static POOLS: Lazy<Arc<ShardedTable<PoolState>>>            = Lazy::new(Shar
 pub static OBLIGATIONS: Lazy<Arc<ShardedTable<ObligationState>>> = Lazy::new(ShardedTable::new);
 pub static CURRENT_SLOT: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool(reserve_a: u64, reserve_b: u64, fee_bps: u16) -> PoolState {
+        PoolState {
+            pool_id: Pubkey::default(), dex: Dex::Raydium,
+            token_a_mint: Pubkey::default(), token_b_mint: Pubkey::default(),
+            reserve_a, reserve_b, fee_bps, slot: 0, clmm: None,
+        }
+    }
+
+    #[test]
+    fn constant_product_quote_respects_fee() {
+        // 1000/1000 pool, 30bps fee, swap 100 in. output should be less than a fee-less
+        // constant-product swap would give (100 * 1000 / 1100 = 90.9...).
+        let p = pool(1_000, 1_000, 30);
+        let out = p.quote_a_to_b(100);
+        assert!(out < 91, "expected fee to eat into output, got {out}");
+        assert!(out > 85, "fee is only 30bps, shouldn't eat this much, got {out}");
+    }
+
+    #[test]
+    fn constant_product_zero_reserve_returns_zero_not_panic() {
+        let p = pool(0, 1_000, 30);
+        assert_eq!(p.quote_a_to_b(100), 0);
+    }
+
+    #[test]
+    fn constant_product_is_symmetric_at_parity() {
+        // equal reserves, equal fee both directions, quoting a->b then the reverse amount
+        // b->a should land close to the original input (not exact, that's what the fee is for).
+        let p = pool(500_000, 500_000, 25);
+        let out_b = p.quote_a_to_b(10_000);
+        let back_a = p.quote_b_to_a(out_b);
+        assert!(back_a < 10_000, "round trip should lose value to fees, got {back_a}");
+        assert!(back_a > 9_900, "shouldn't lose more than ~2x the fee on a round trip, got {back_a}");
+    }
+
+    #[test]
+    fn ltv_bps_saturates_instead_of_wrapping() {
+        // this is the bug that was here before: (huge_ratio as u16) truncates mod 65536
+        // before the .min() ever runs, so a catastrophic LTV could read back as healthy.
+        let obl = ObligationState {
+            obligation_pubkey: Pubkey::default(), owner: Pubkey::default(),
+            protocol: LendingProtocol::Kamino,
+            collateral_value: 1, // tiny collateral
+            borrow_value: u128::MAX / 2, // huge debt relative to collateral
+            liquidation_threshold_bps: 8_000, slot: 0,
+        };
+        assert_eq!(obl.ltv_bps(), u16::MAX, "should saturate, not wrap to a small number");
+    }
+
+    #[test]
+    fn ltv_bps_zero_collateral_is_max_not_divide_by_zero() {
+        let obl = ObligationState {
+            obligation_pubkey: Pubkey::default(), owner: Pubkey::default(),
+            protocol: LendingProtocol::Solend,
+            collateral_value: 0,
+            borrow_value: 100,
+            liquidation_threshold_bps: 8_000, slot: 0,
+        };
+        assert_eq!(obl.ltv_bps(), u16::MAX);
+    }
+
+    #[test]
+    fn clmm_price_matches_sqrt_price_squared() {
+        // sqrt_price for a 1:1 price pool is exactly 2^64 (Q64.64 representation of 1.0)
+        let sqrt_price_one: u128 = 1u128 << 64;
+        let p = PoolState {
+            pool_id: Pubkey::default(), dex: Dex::OrcaWhirlpool,
+            token_a_mint: Pubkey::default(), token_b_mint: Pubkey::default(),
+            reserve_a: 0, reserve_b: 0, fee_bps: 30, slot: 0,
+            clmm: Some(ClmmState { sqrt_price: sqrt_price_one, liquidity: 1_000_000, tick_current: 0, tick_spacing: 64 }),
+        };
+        let price = p.price_a_in_b().unwrap();
+        assert!((price - 1.0).abs() < 1e-9, "sqrt_price of 2^64 should be exactly price 1.0, got {price}");
+    }
+
+    #[test]
+    fn clmm_quote_moves_price_in_the_right_direction() {
+        let sqrt_price_one: u128 = 1u128 << 64;
+        let p = PoolState {
+            pool_id: Pubkey::default(), dex: Dex::OrcaWhirlpool,
+            token_a_mint: Pubkey::default(), token_b_mint: Pubkey::default(),
+            reserve_a: 0, reserve_b: 0, fee_bps: 0, slot: 0,
+            clmm: Some(ClmmState { sqrt_price: sqrt_price_one, liquidity: 1_000_000_000_000, tick_current: 0, tick_spacing: 64 }),
+        };
+        // small trade relative to liquidity, output should be close to input at ~1:1 price
+        let out = p.quote_a_to_b(1_000);
+        assert!(out > 0, "should quote a nonzero amount for a small trade against real liquidity");
+        assert!(out <= 1_000, "can't get more out than in at a 1:1 price with zero fee");
+        assert!(out > 900, "small trade against large liquidity shouldn't slip this much, got {out}");
+    }
+}
