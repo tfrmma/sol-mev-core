@@ -33,7 +33,7 @@ use crate::{
 const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
 const ORCA_SWAP_V2:   &str = "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP";
 const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
-const KAMINO_LENDING: &str = "KLend2g3cP87fffoy8q1mQqGKjrL1AyGGFsDGJr5J6Z";
+const KAMINO_LENDING: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"; // verified against Kamino-Finance/klend README
 const SOLEND_PROGRAM: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
 
 // parsed once at startup, account updates come in fast enough that we don't want
@@ -279,9 +279,11 @@ fn is_lending_owner(owner: &Pubkey) -> bool {
 fn decode_pool(pubkey: Pubkey, owner: &Pubkey, data: &[u8], slot: u64) -> Option<PoolState> {
     if owner == &*RAYDIUM_AMM_V4_PK {
         decode_raydium_pool(pubkey, data, slot)
+    } else if owner == &*ORCA_WHIRLPOOL_PK {
+        decode_whirlpool_pool(pubkey, data, slot)
     } else {
-        // orca/whirlpool: TODO, layout differs per pool version.
-        // at minimum check discriminant before returning None to avoid log spam.
+        // orca legacy (token-swap program): TODO, same story as raydium below but for the
+        // spl-token-swap layout. lower priority, whirlpool has mostly eaten its volume.
         None
     }
 }
@@ -305,6 +307,39 @@ fn decode_raydium_pool(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<PoolSta
         pool_id: pubkey, dex: Dex::Raydium,
         token_a_mint: coin_mint, token_b_mint: pc_mint,
         reserve_a, reserve_b, fee_bps: 25, slot,
+        clmm: None,
+    })
+}
+
+// whirlpool account layout, byte offsets verified against
+// orca-so/whirlpools/programs/whirlpool/src/state/whirlpool.rs (anchor, borsh-packed, no padding).
+// discriminant is sha256("account:Whirlpool")[..8], confirmed against the repo's own test.
+const WHIRLPOOL_DISC: [u8; 8] = [0x3f, 0x95, 0xd1, 0x0c, 0xe1, 0x80, 0x63, 0x09];
+const WHIRLPOOL_MIN_LEN: usize = 261; // through fee_growth_global_b, ignoring reward_infos tail
+
+fn decode_whirlpool_pool(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<PoolState> {
+    if data.len() < WHIRLPOOL_MIN_LEN { return None; }
+    if data[..8] != WHIRLPOOL_DISC     { return None; }
+
+    let tick_spacing     = u16::from_le_bytes(data[41..43].try_into().ok()?);
+    let fee_rate         = u16::from_le_bytes(data[45..47].try_into().ok()?);
+    let liquidity        = u128::from_le_bytes(data[49..65].try_into().ok()?);
+    let sqrt_price        = u128::from_le_bytes(data[65..81].try_into().ok()?);
+    let tick_current      = i32::from_le_bytes(data[81..85].try_into().ok()?);
+    let token_mint_a      = Pubkey::try_from(&data[101..133]).ok()?;
+    let token_mint_b      = Pubkey::try_from(&data[181..213]).ok()?;
+
+    // fee_rate is hundredths of a basis point (u16::MAX ~= 6.5%), our fee_bps field is plain bps.
+    let fee_bps = (fee_rate / 100).min(u16::MAX);
+
+    if liquidity == 0 || sqrt_price == 0 { return None; } // no liquidity, nothing to quote against
+
+    Some(PoolState {
+        pool_id: pubkey, dex: Dex::OrcaWhirlpool,
+        token_a_mint: token_mint_a, token_b_mint: token_mint_b,
+        reserve_a: 0, reserve_b: 0, // not meaningful for CLMM, see clmm field instead
+        fee_bps, slot,
+        clmm: Some(ClmmState { sqrt_price, liquidity, tick_current, tick_spacing }),
     })
 }
 
