@@ -67,8 +67,32 @@ impl LiquidationScanner {
         opps
     }
 
+    // NOT WIRED UP YET. leaving the old hand-rolled 2-account stub in place below on purpose,
+    // it's clearly broken and errors loudly instead of silently building a wrong tx.
+    //
+    // the real fix: Kamino publishes an official crate, klend-interface (crates.io, no
+    // anchor-lang dep, targets solana-sdk 2.x, already added to Cargo.toml). it has a
+    // `helpers::liquidate::liquidate(...)` function that returns the *entire* correct
+    // Vec<Instruction> (refreshes + liquidate_and_redeem_v2), fully accounted for. use that
+    // instead of hand-building AccountMetas here.
+    //
+    // problem: this scanner is sync and has no RPC client, but building the real ix needs
+    // live Reserve account data (`ReserveInfo::from_account_data`) for the repay reserve,
+    // the withdraw reserve, and every reserve on the obligation. that means this has to move
+    // into executor.rs::execute_liquidation, which already owns an RpcClient. rough shape:
+    //
+    //   1. klend_interface::ObligationContext::reserve_addresses_for_obligation(&obligation_data)
+    //   2. rpc.get_multiple_accounts(&reserve_addrs) in one batched call
+    //   3. ReserveInfo::from_account_data(pubkey, &data) for repay/withdraw/each obligation reserve
+    //   4. klend_interface::helpers::liquidate::liquidate(liquidator, &repay, &withdraw, &obligation_info,
+    //        &obligation_reserves, user_source_liquidity, user_dest_collateral, user_dest_liquidity,
+    //        opp.repay_amount, min_out, 0, None, None)
+    //
+    // this also fixes the collateral_mint/repay_mint FIXME below for free: klend_interface's
+    // zero-copy state::Obligation gives you the real deposit_reserve/borrow_reserve pubkeys
+    // instead of the owner-as-placeholder hack currently in build_opportunity.
     pub fn build_kamino_liquidation_ix(&self, opp: &LiqOpportunity) -> Instruction {
-        let program_id: Pubkey = "KLend2g3cP87fffoy8q1mQqGKjrL1AyGGFsDGJr5J6Z".parse().unwrap();
+        let program_id: Pubkey = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD".parse().unwrap();
         // discriminant from idl. if kamino redeploys and changes this we'll find out the hard way.
         let disc: [u8; 8] = [0xb5, 0xe9, 0x4c, 0xbb, 0x68, 0x91, 0x24, 0x1d];
         let mut data = disc.to_vec();
@@ -79,9 +103,8 @@ impl LiquidationScanner {
             accounts: vec![
                 AccountMeta::new(self.liquidator, true),
                 AccountMeta::new(opp.obligation, false),
-                // TODO: add remaining accounts from obligation collateral+reserve metadata.
-                //       right now this ix will fail on-chain. need to parse the full obligation
-                //       layout to pull vault/reserve/oracle pubkeys. tracked in #47.
+                // deliberately incomplete, see the block comment above. this will fail on-chain,
+                // that's the point, don't fill it in piecemeal, replace the whole thing.
             ],
             data,
         }
