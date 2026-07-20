@@ -257,11 +257,56 @@ impl Executor {
         Ok(Instruction { program_id, accounts, data })
     }
 
-    // TODO(#4): orca legacy token-swap accounts, needs a source-verified pass same as raydium above.
-    //           not doing it from memory, spl-token-swap's account order has to be checked against
-    //           solana-labs/solana-program-library/docs/src/token-swap.md before this ships.
-    fn orca_ix(&self, _meta: &PoolMeta, _input: Pubkey, _output: Pubkey, _amount_in: u64, _min_out: u64) -> Result<Instruction> {
-        Err(anyhow::anyhow!("orca ix builder not implemented yet, see TODO(#4)"))
+    // legacy SPL token-swap program (orca's original AMM, pre-whirlpool). verified against
+    // solana-labs/solana-program-library/token-swap/program/src/instruction.rs: tag=1 (Swap),
+    // data = tag(1) + amount_in(8) + minimum_amount_out(8) = 17 bytes, 13 accounts (+1 optional
+    // host_fee, omitted here).
+    //
+    // needs pool_mint and pool_fee_account, which PoolMeta doesn't have dedicated fields for.
+    // convention: extra_accounts[0] = pool_mint, extra_accounts[1] = pool_fee_account. document
+    // this in registry.json if you're populating orca legacy pools by hand.
+    fn orca_ix(&self, meta: &PoolMeta, input: Pubkey, output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
+        let program_id = meta.program_pubkey().context("bad program_id in registry")?;
+        let swap_pubkey = meta.pool_pubkey().context("bad pool_id in registry")?;
+        let vault_a     = meta.vault_a_pk().context("bad token_a_vault in registry")?;
+        let vault_b     = meta.vault_b_pk().context("bad token_b_vault in registry")?;
+        let mint_a      = meta.token_a_mint_pk().context("bad token_a_mint in registry")?;
+        let mint_b      = meta.token_b_mint_pk().context("bad token_b_mint in registry")?;
+        let extra = meta.extra_pubkeys();
+        let pool_mint = *extra.first().context("orca legacy pool missing extra_accounts[0]=pool_mint")?;
+        let pool_fee  = *extra.get(1).context("orca legacy pool missing extra_accounts[1]=pool_fee_account")?;
+        let token_program: Pubkey = SPL_TOKEN_PROGRAM_ID.parse()?;
+        let owner = self.signer.pubkey();
+
+        // authority is a PDA seeded on just the swap account, the on-chain nonce was generated
+        // the same way at pool init time, find_program_address reproduces it deterministically.
+        let (authority, _bump) = Pubkey::find_program_address(&[swap_pubkey.as_ref()], &program_id);
+
+        let a_to_b = input == mint_a;
+        let (swap_source, swap_dest) = if a_to_b { (vault_a, vault_b) } else { (vault_b, vault_a) };
+
+        let mut data = vec![1u8]; // SwapInstruction::Swap
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_out.to_le_bytes());
+
+        let accounts = vec![
+            AccountMeta::new_readonly(swap_pubkey, false),
+            AccountMeta::new_readonly(authority, false),
+            AccountMeta::new_readonly(owner, true), // user_transfer_authority: self-signing, no separate delegate
+            AccountMeta::new(derive_ata(&owner, &input)?, false),
+            AccountMeta::new(swap_source, false),
+            AccountMeta::new(swap_dest, false),
+            AccountMeta::new(derive_ata(&owner, &output)?, false),
+            AccountMeta::new(pool_mint, false),
+            AccountMeta::new(pool_fee, false),
+            AccountMeta::new_readonly(input, false),
+            AccountMeta::new_readonly(output, false),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(token_program, false),
+        ];
+
+        Ok(Instruction { program_id, accounts, data })
     }
 
     // whirlpool swap, verified against orca-so/whirlpools/programs/whirlpool/src/instructions/swap.rs
