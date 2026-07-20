@@ -8,6 +8,7 @@ name = "mev-bot"
 path = "src/main.rs"
 
 [dependencies]
+klend-interface = "0.6"
 tokio        = { version = "1.38", features = ["full"] }
 tokio-stream = "0.1"
 
@@ -16,6 +17,7 @@ solana-sdk                = "2.1"
 solana-program            = "2.1"
 curve25519-dalek          = "4"
 ed25519-dalek             = "2"
+openssl                   = { version = "0.10", features = ["vendored"] }
 
 yellowstone-grpc-client = "13.2"
 yellowstone-grpc-proto  = "12.5"
