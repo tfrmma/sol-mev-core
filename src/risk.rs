@@ -1,203 +1,186 @@
-// EWMA volatility + circuit breaker + profit adjustment for liquidations.
-// nothing fancy, RiskMetrics-style, lambda=0.94 because that's what everyone uses
-// and it works well enough on crypto (high kurtosis be damned).
-use solana_sdk::pubkey::Pubkey;
-use std::{
-    collections::HashMap,
-    sync::{Arc, RwLock},
-};
-use tracing::{debug, warn};
+use solana_sdk::{instruction::{AccountMeta, Instruction}, pubkey::Pubkey};
+use std::sync::Arc;
+use tracing::{debug, info};
 
-use crate::state::{PoolState, POOLS};
+use crate::config::BotConfig;
+use crate::risk::RiskEngine;
+use crate::state::{LendingProtocol, ObligationState, PoolState, OBLIGATIONS, POOLS};
 
-const EWMA_LAMBDA: f64           = 0.94;
-const CIRCUIT_BREAKER_SIGMA: f64 = 0.08;  // 8% per-update sigma. if we're here, something is wrong.
-const SLIPPAGE_SAFETY_MULT: f64  = 1.5;   // conservative. we'd rather pass than blow up.
-const EXECUTION_SLOTS: u64       = 2;     // ~800ms. optimistic but Jito bundles land fast.
-
-struct AssetVol {
-    last_price:    f64,
-    ewma_variance: f64,
-    last_update:   std::time::Instant,
+#[derive(Debug, Clone)]
+pub struct LiqOpportunity {
+    pub obligation:               Pubkey,
+    pub protocol:                 LendingProtocol,
+    pub owner:                    Pubkey,
+    pub repay_amount:             u64,
+    pub repay_mint:               Pubkey,
+    pub collateral_mint:          Pubkey,
+    pub gross_profit_lamports:    i64,
+    pub adjusted_profit_lamports: Option<i64>, // None means risk engine vetoed it
+    pub health_factor:            f64,
 }
 
-impl AssetVol {
-    fn new(price: f64) -> Self {
-        Self { last_price: price, ewma_variance: 0.0, last_update: std::time::Instant::now() }
-    }
-
-    fn update(&mut self, price: f64) {
-        if self.last_price <= 0.0 || price <= 0.0 { return; }
-        let r = (price / self.last_price).ln();
-        self.ewma_variance = EWMA_LAMBDA * self.ewma_variance + (1.0 - EWMA_LAMBDA) * r * r;
-        self.last_price    = price;
-        self.last_update   = std::time::Instant::now();
-    }
-
-    fn sigma(&self) -> f64 { self.ewma_variance.sqrt() }
-
-    // 2σ haircut scaled by sqrt(execution window). standard microstructure stuff.
-    // cap at 25% because beyond that our quote is garbage anyway and we should just skip.
-    fn price_haircut(&self, slots: u64) -> f64 {
-        (2.0 * self.sigma() * (slots as f64).sqrt()).min(0.25)
+impl LiqOpportunity {
+    pub fn effective_profit(&self) -> i64 {
+        self.adjusted_profit_lamports.unwrap_or(self.gross_profit_lamports)
     }
 }
 
-// how much of the exit will we lose to price impact. multiply by safety factor because
-// we usually can't exit instantly and the market moves against us.
-fn exit_slippage(pool: &PoolState, sell_amount: u64, sell_is_a: bool) -> f64 {
-    let reserve = if sell_is_a { pool.reserve_a } else { pool.reserve_b };
-    if reserve == 0 { return 1.0; }
-    (sell_amount as f64 / (reserve as f64 + sell_amount as f64)) * SLIPPAGE_SAFETY_MULT
+pub struct LiquidationScanner {
+    min_profit: u64,
+    liquidator: Pubkey,
+    risk:       Arc<RiskEngine>,
 }
 
-pub struct RiskEngine {
-    vol:              Arc<RwLock<HashMap<Pubkey, AssetVol>>>,
-    fee_p95_lamports: std::sync::atomic::AtomicU64,
-}
+impl LiquidationScanner {
+    pub fn new(config: &BotConfig, liquidator: Pubkey, risk: Arc<RiskEngine>) -> Self {
+        Self { min_profit: config.min_profit_lamports, liquidator, risk }
+    }
 
-impl RiskEngine {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            vol:              Arc::new(RwLock::new(HashMap::with_capacity(128))),
-            fee_p95_lamports: std::sync::atomic::AtomicU64::new(25_000),
+    pub fn evaluate(&self, obligation_key: Pubkey) -> Option<LiqOpportunity> {
+        let obl = OBLIGATIONS.get_cloned(&obligation_key)?;
+        if !obl.is_underwater() { return None; }
+
+        info!("underwater {} hf={:.4} ltv={}/{} protocol={:?}",
+              obligation_key, obl.health_factor(), obl.ltv_bps(),
+              obl.liquidation_threshold_bps, obl.protocol);
+
+        let opp = self.build_opportunity(&obl)?;
+        if opp.effective_profit() < self.min_profit as i64 {
+            debug!("profit too low: {} (adjusted={:?})", opp.gross_profit_lamports, opp.adjusted_profit_lamports);
+            return None;
+        }
+        info!("liquidation: obligation={} gross={} adjusted={:?}",
+              obligation_key, opp.gross_profit_lamports, opp.adjusted_profit_lamports);
+        Some(opp)
+    }
+
+    // scan everything. called less frequently than evaluate(), don't be ashamed of the O(n).
+    pub fn scan_all(&self) -> Vec<LiqOpportunity> {
+        let mut opps: Vec<_> = OBLIGATIONS.collect_all().into_iter()
+            .filter(|o| o.is_underwater())
+            .filter_map(|o| {
+                let opp = self.build_opportunity(&o)?;
+                (opp.effective_profit() >= self.min_profit as i64).then_some(opp)
+            })
+            .collect();
+        opps.sort_by(|a, b| b.effective_profit().cmp(&a.effective_profit()));
+        opps
+    }
+
+    // NOT WIRED UP YET. leaving the old hand-rolled 2-account stub in place below on purpose,
+    // it's clearly broken and errors loudly instead of silently building a wrong tx.
+    //
+    // the real fix: Kamino publishes an official crate, klend-interface (crates.io, no
+    // anchor-lang dep, targets solana-sdk 2.x, already added to Cargo.toml). it has a
+    // `helpers::liquidate::liquidate(...)` function that returns the *entire* correct
+    // Vec<Instruction> (refreshes + liquidate_and_redeem_v2), fully accounted for. use that
+    // instead of hand-building AccountMetas here.
+    //
+    // problem: this scanner is sync and has no RPC client, but building the real ix needs
+    // live Reserve account data (`ReserveInfo::from_account_data`) for the repay reserve,
+    // the withdraw reserve, and every reserve on the obligation. that means this has to move
+    // into executor.rs::execute_liquidation, which already owns an RpcClient. rough shape:
+    //
+    //   1. klend_interface::ObligationContext::reserve_addresses_for_obligation(&obligation_data)
+    //   2. rpc.get_multiple_accounts(&reserve_addrs) in one batched call
+    //   3. ReserveInfo::from_account_data(pubkey, &data) for repay/withdraw/each obligation reserve
+    //   4. klend_interface::helpers::liquidate::liquidate(liquidator, &repay, &withdraw, &obligation_info,
+    //        &obligation_reserves, user_source_liquidity, user_dest_collateral, user_dest_liquidity,
+    //        opp.repay_amount, min_out, 0, None, None)
+    //
+    // this also fixes the collateral_mint/repay_mint FIXME below for free: klend_interface's
+    // zero-copy state::Obligation gives you the real deposit_reserve/borrow_reserve pubkeys
+    // instead of the owner-as-placeholder hack currently in build_opportunity.
+    pub fn build_kamino_liquidation_ix(&self, opp: &LiqOpportunity) -> Instruction {
+        let program_id: Pubkey = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD".parse().unwrap();
+        // discriminant from idl. if kamino redeploys and changes this we'll find out the hard way.
+        let disc: [u8; 8] = [0xb5, 0xe9, 0x4c, 0xbb, 0x68, 0x91, 0x24, 0x1d];
+        let mut data = disc.to_vec();
+        data.extend_from_slice(&opp.repay_amount.to_le_bytes());
+        data.extend_from_slice(&1u64.to_le_bytes()); // min_acceptable_received_collateral_amount
+        Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(self.liquidator, true),
+                AccountMeta::new(opp.obligation, false),
+                // deliberately incomplete, see the block comment above. this will fail on-chain,
+                // that's the point, don't fill it in piecemeal, replace the whole thing.
+            ],
+            data,
+        }
+    }
+
+    fn build_opportunity(&self, obl: &ObligationState) -> Option<LiqOpportunity> {
+        let close_factor = self.close_factor(obl);
+        let repay_value  = obl.borrow_value * close_factor as u128 / 10_000;
+        let repay_lamps  = (repay_value / 1_000_000_000) as u64;
+        let bonus_bps    = self.bonus_bps(obl);
+        let collateral   = repay_lamps + repay_lamps * bonus_bps / 10_000;
+        let gross        = collateral as i64 - repay_lamps as i64;
+
+        // FIXME: both mints are wrong, need to decode from the obligation's deposit/borrow lists.
+        //        using owner as placeholder so it at least compiles. don't ship this.
+        let collateral_mint = obl.owner;
+        let repay_mint      = obl.owner;
+
+        let adjusted = self.best_exit_pool(collateral_mint).and_then(|pool| {
+            let exit_is_a = pool.token_a_mint == collateral_mint;
+            self.risk.adjusted_profit(gross, collateral_mint, &pool, collateral, exit_is_a)
+        });
+
+        Some(LiqOpportunity {
+            obligation: obl.obligation_pubkey,
+            protocol: obl.protocol.clone(),
+            owner: obl.owner,
+            repay_amount: repay_lamps,
+            repay_mint,
+            collateral_mint,
+            gross_profit_lamports: gross,
+            adjusted_profit_lamports: adjusted,
+            health_factor: obl.health_factor(),
         })
     }
 
-    // called on every pool account update from geyser
-    pub fn on_pool_update(&self, pool: &PoolState) {
-        if let Some(price) = pool.price_a_in_b() {
-            self.update_vol(pool.token_a_mint, price);
-            if price > 0.0 { self.update_vol(pool.token_b_mint, 1.0 / price); }
+    fn close_factor(&self, obl: &ObligationState) -> u64 {
+        match obl.protocol {
+            LendingProtocol::Kamino => self.kamino_close_factor(obl),
+            // solend and marginfi both use 50% flat. boring but fine.
+            LendingProtocol::Solend | LendingProtocol::MarginFi => 5_000,
         }
     }
 
-    pub fn update_fee_p95(&self, lamports: u64) {
-        self.fee_p95_lamports.store(lamports, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub fn sigma_for(&self, mint: Pubkey) -> f64 {
-        // default 1% if we haven't seen this mint yet. not great, not terrible.
-        self.vol.read().unwrap().get(&mint).map(|v| v.sigma()).unwrap_or(0.01)
-    }
-
-    pub fn circuit_breaker_active(&self, mint: Pubkey) -> bool {
-        let sigma = self.sigma_for(mint);
-        if sigma > CIRCUIT_BREAKER_SIGMA {
-            warn!("circuit breaker: σ={:.4} for {mint} > {CIRCUIT_BREAKER_SIGMA:.4}");
-            return true;
-        }
-        false
-    }
-
-    // net profit after haircut for price vol, exit slippage, and fees.
-    // returns None if the circuit breaker is tripped or net goes negative.
-    pub fn adjusted_profit(
-        &self,
-        gross:           i64,
-        collateral_mint: Pubkey,
-        exit_pool:       &PoolState,
-        exit_amount:     u64,
-        exit_is_a:       bool,
-    ) -> Option<i64> {
-        if self.circuit_breaker_active(collateral_mint) { return None; }
-
-        let haircut = self.vol.read().unwrap()
-            .get(&collateral_mint)
-            .map(|v| v.price_haircut(EXECUTION_SLOTS))
-            .unwrap_or(0.02); // 2% default when blind
-
-        let slippage_cost = exit_slippage(exit_pool, exit_amount, exit_is_a) * exit_amount as f64;
-        let fee           = self.fee_p95_lamports.load(std::sync::atomic::Ordering::Relaxed) as f64;
-        let net           = gross as f64 * (1.0 - haircut) - slippage_cost - fee;
-
-        debug!("risk: gross={gross} haircut={haircut:.3} slip={slippage_cost:.0} fee={fee:.0} → net={net:.0}");
-
-        if net > 0.0 { Some(net as i64) } else { None }
-    }
-
-    pub fn volatility_report(&self) -> Vec<(Pubkey, f64)> {
-        self.vol.read().unwrap().iter().map(|(k, v)| (*k, v.sigma())).collect()
-    }
-
-    fn update_vol(&self, mint: Pubkey, price: f64) {
-        self.vol.write().unwrap()
-            .entry(mint)
-            .or_insert_with(|| AssetVol::new(price))
-            .update(price);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::state::Dex;
-
-    fn pool(reserve_a: u64, reserve_b: u64) -> PoolState {
-        PoolState {
-            pool_id: Pubkey::default(), dex: Dex::Raydium,
-            token_a_mint: Pubkey::default(), token_b_mint: Pubkey::default(),
-            reserve_a, reserve_b, fee_bps: 25, slot: 0, clmm: None,
+    fn bonus_bps(&self, obl: &ObligationState) -> u64 {
+        match obl.protocol {
+            LendingProtocol::Kamino => {
+                // tiered bonus based on how far underwater they are
+                let excess = obl.ltv_bps().saturating_sub(obl.liquidation_threshold_bps);
+                if excess > 1000 { 1500 } else if excess > 500 { 1000 } else { 700 }
+            }
+            _ => 500, // 5% flat for everyone else
         }
     }
 
-    #[test]
-    fn exit_slippage_zero_reserve_is_total_loss() {
-        let p = pool(0, 1_000);
-        assert_eq!(exit_slippage(&p, 100, true), 1.0);
+    // kamino's dynamic close factor: slides from ~20% at threshold up to 100% at full insolvency.
+    // getting this wrong is expensive, overclosing burns capital, underclosing leaves profit on table.
+    fn kamino_close_factor(&self, obl: &ObligationState) -> u64 {
+        let ltv       = obl.ltv_bps() as u64;
+        let threshold = obl.liquidation_threshold_bps as u64;
+        if ltv >= 10_000 { return 10_000; }
+        let excess = ltv.saturating_sub(threshold);
+        let range  = 10_000u64.saturating_sub(threshold).max(1);
+        (2_000 + excess * 8_000 / range).min(10_000)
     }
 
-    #[test]
-    fn exit_slippage_scales_with_size_and_safety_mult() {
-        let p = pool(1_000_000, 1_000_000);
-        // 1000 / (1_000_000 + 1000) * 1.5, small trade against deep liquidity should be tiny
-        let small = exit_slippage(&p, 1_000, true);
-        let large = exit_slippage(&p, 500_000, true);
-        assert!(small < large, "bigger trade should slip more");
-        assert!(small < 0.01, "1000 against a 1M pool shouldn't slip more than 1%, got {small}");
-    }
-
-    #[test]
-    fn asset_vol_sigma_starts_at_zero() {
-        let v = AssetVol::new(100.0);
-        assert_eq!(v.sigma(), 0.0, "no price history yet, no variance");
-    }
-
-    #[test]
-    fn asset_vol_sigma_rises_after_a_price_jump() {
-        let mut v = AssetVol::new(100.0);
-        v.update(150.0); // 50% jump, should register real variance
-        assert!(v.sigma() > 0.0, "sigma should be nonzero after a price move");
-    }
-
-    #[test]
-    fn asset_vol_ignores_nonpositive_prices() {
-        // a zero or negative price is bad data (decode bug, empty pool, whatever), not a real move.
-        // update() should just no-op instead of feeding ln(negative) or ln(0) into the EWMA.
-        let mut v = AssetVol::new(100.0);
-        v.update(0.0);
-        v.update(-5.0);
-        assert_eq!(v.sigma(), 0.0);
-        assert_eq!(v.last_price, 100.0);
-    }
-
-    #[test]
-    fn adjusted_profit_none_when_net_negative() {
-        let risk = RiskEngine::new();
-        let mint = Pubkey::new_unique();
-        let exit_pool = pool(1_000, 1_000); // tiny pool, exiting into it is expensive
-        // gross profit smaller than what fees + slippage will eat
-        let result = risk.adjusted_profit(1_000, mint, &exit_pool, 500, true);
-        assert!(result.is_none(), "should reject a trade where costs exceed gross profit");
-    }
-
-    #[test]
-    fn adjusted_profit_some_when_comfortably_net_positive() {
-        let risk = RiskEngine::new();
-        let mint = Pubkey::new_unique();
-        let exit_pool = pool(10_000_000_000, 10_000_000_000); // deep pool, minimal slippage
-        let result = risk.adjusted_profit(1_000_000_000, mint, &exit_pool, 1_000, true);
-        assert!(result.is_some(), "large gross profit against deep liquidity should clear costs");
-        assert!(result.unwrap() < 1_000_000_000, "adjusted profit should still be less than gross");
+    // find deepest pool for this collateral. deep = less slippage on exit.
+    fn best_exit_pool(&self, mint: Pubkey) -> Option<PoolState> {
+        let mut best: Option<PoolState> = None;
+        let mut best_liq = 0u64;
+        POOLS.for_each(|_, pool| {
+            if pool.token_a_mint == mint || pool.token_b_mint == mint {
+                let liq = pool.reserve_a.min(pool.reserve_b);
+                if liq > best_liq { best_liq = liq; best = Some(pool.clone()); }
+            }
+        });
+        best
     }
 }
