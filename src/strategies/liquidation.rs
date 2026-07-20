@@ -1,6 +1,6 @@
 use solana_sdk::{instruction::{AccountMeta, Instruction}, pubkey::Pubkey};
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::config::BotConfig;
 use crate::risk::RiskEngine;
