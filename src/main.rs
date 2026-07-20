@@ -10,6 +10,7 @@ mod state;
 mod strategies;
 
 use anyhow::Result;
+use solana_sdk::signer::Signer;
 use std::{path::Path, sync::Arc, time::Duration};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
