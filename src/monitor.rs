@@ -26,7 +26,7 @@ use crate::{
     risk::RiskEngine,
     simulator::AccountCache,
     smart_money::SmartMoneyClassifier,
-    state::{Dex, LendingProtocol, ObligationState, PoolState, CURRENT_SLOT, OBLIGATIONS, POOLS},
+    state::{ClmmState, Dex, LendingProtocol, ObligationState, PoolState, CURRENT_SLOT, OBLIGATIONS, POOLS},
 };
 
 // program IDs, keep in sync with registry.rs defaults
@@ -119,9 +119,11 @@ impl Monitor {
     }
 
     async fn stream_loop(&self) -> Result<()> {
-        let mut client = GeyserGrpcClient::connect(
-            self.endpoint.clone(), Some(self.token.clone()), None,
-        ).await?;
+        let mut client = GeyserGrpcClient::build_from_shared(self.endpoint.clone())?
+            .x_token(Some(self.token.clone()))?
+            .tls_config(yellowstone_grpc_client::ClientTlsConfig::new().with_native_roots())?
+            .connect()
+            .await?;
 
         let program_ids = self.registry
             .as_ref()
