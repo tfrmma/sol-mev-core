@@ -240,7 +240,7 @@ impl Monitor {
         if let Some(ref sm) = self.smart_money {
             self.feed_smart_money_classifier(&tx, sm);
         }
-        if let Some(swap) = extract_pending_swap(slot, &tx) {
+        if let Some(swap) = extract_pending_swap(slot, &tx, self.registry.as_ref()) {
             debug!("pending swap pool={}", swap.pool);
             let _ = self.tx.try_send(Opportunity::PendingSwap(swap));
         }
@@ -368,12 +368,94 @@ fn decode_obligation(pubkey: Pubkey, program: &Pubkey, data: &[u8], slot: u64) -
     })
 }
 
-// TODO: decode swap instructions from tx data (#52).
-// per-protocol discriminant matching + argument parsing needed.
-// without this, sandwich detection can never fire.
+// derives a wallet's associated token account, same PDA logic as executor.rs::derive_ata.
+// duplicated here on purpose rather than importing across modules, it's six lines and monitor.rs
+// shouldn't depend on executor.rs. worth pulling into a shared util module if a third copy shows up.
+fn derive_ata(wallet: &Pubkey, mint: &Pubkey) -> Option<Pubkey> {
+    const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+    const ATA_PROGRAM:   &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+    let token_program: Pubkey = TOKEN_PROGRAM.parse().ok()?;
+    let ata_program:   Pubkey = ATA_PROGRAM.parse().ok()?;
+    let seeds = [wallet.as_ref(), token_program.as_ref(), mint.as_ref()];
+    Some(Pubkey::find_program_address(&seeds, &ata_program).0)
+}
+
+// scans both top-level and inner (CPI) instructions for a raydium SwapBaseInV2. inner instructions
+// matter because most retail volume routes through an aggregator (jupiter) that CPIs into raydium,
+// the top-level instruction is the aggregator's own, not raydium's.
+//
+// note on "pending": solana doesn't have a real mempool, geyser streams transactions at whatever
+// commitment level you subscribed at (processed here, see registry.rs subscribe config). by the
+// time we see this the tx has already landed in a block, just not confirmed yet. sandwiching here
+// means fast-following in the same or next slot via jito bundle, not classic mempool frontrunning.
+//
+// account layout assumed below (SwapBaseInV2, tag 16): verified against raydium-amm's own
+// instruction.rs doc comments, same 8-account layout used in executor.rs::raydium_ix.
+//   0 token program, 1 amm, 2 authority, 3 coin vault, 4 pc vault,
+//   5 user source token account, 6 user destination token account, 7 user wallet (signer)
 fn extract_pending_swap(
-    _slot: u64,
-    _tx:   &yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo,
+    slot: u64,
+    tx:       &yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo,
+    registry: Option<&Registry>,
 ) -> Option<PendingSwap> {
+    let registry = registry?; // no registry, no way to resolve pool -> mints, nothing to do
+    let inner    = tx.transaction.as_ref()?;
+    let sig      = bs58::encode(&tx.signature).into_string();
+    let msg      = inner.message.as_ref()?;
+    let meta     = tx.meta.as_ref();
+
+    // failed txs didn't move the pool, nothing to sandwich
+    if meta.map(|m| m.err.is_some()).unwrap_or(false) { return None; }
+
+    // full account list needs the dynamically-loaded lookup table addresses appended, static
+    // account_keys alone is incomplete for v0 transactions since yellowstone-grpc v3+.
+    let mut keys: Vec<Pubkey> = msg.account_keys.iter()
+        .filter_map(|b| Pubkey::try_from(b.as_slice()).ok())
+        .collect();
+    if let Some(m) = meta {
+        keys.extend(m.loaded_writable_addresses.iter().filter_map(|b| Pubkey::try_from(b.as_slice()).ok()));
+        keys.extend(m.loaded_readonly_addresses.iter().filter_map(|b| Pubkey::try_from(b.as_slice()).ok()));
+    }
+
+    // (program_id_index, accounts, data) tuples from both top-level and inner instructions
+    let top_level = msg.instructions.iter().map(|ix| (ix.program_id_index, &ix.accounts, &ix.data));
+    let inner_ixs = meta.into_iter()
+        .flat_map(|m| m.inner_instructions.iter())
+        .flat_map(|group| group.instructions.iter())
+        .map(|ix| (ix.program_id_index, &ix.accounts, &ix.data));
+
+    for (program_id_index, accounts, data) in top_level.chain(inner_ixs) {
+        let Some(&program_id) = keys.get(program_id_index as usize) else { continue };
+        if program_id != *RAYDIUM_AMM_V4_PK { continue }
+        if data.len() < 17 || data[0] != 16 { continue } // SwapBaseInV2 discriminant
+        if accounts.len() < 8 { continue }
+
+        let acc = |i: usize| accounts.get(i).and_then(|&idx| keys.get(idx as usize)).copied();
+        let (Some(pool), Some(user)) = (acc(1), acc(7)) else { continue };
+        let Some(user_source) = acc(5) else { continue };
+
+        let Some(meta) = registry.pool_meta(&pool) else { continue }; // unregistered pool, can't resolve mints
+        let (Some(mint_a), Some(mint_b)) = (meta.token_a_mint_pk(), meta.token_b_mint_pk()) else { continue };
+
+        // direction: whichever candidate mint's ATA matches the user's actual source account.
+        // works without an extra RPC round-trip, assumes the swapper used their standard ATA
+        // (true for the overwhelming majority of swaps, aggregators included).
+        let (input_mint, output_mint) = if derive_ata(&user, &mint_a) == Some(user_source) {
+            (mint_a, mint_b)
+        } else if derive_ata(&user, &mint_b) == Some(user_source) {
+            (mint_b, mint_a)
+        } else {
+            continue; // non-standard source account, can't determine direction cheaply, skip
+        };
+
+        let amount_in      = u64::from_le_bytes(data[1..9].try_into().ok()?);
+        let min_amount_out = u64::from_le_bytes(data[9..17].try_into().ok()?);
+
+        return Some(PendingSwap {
+            signature: sig, user, pool, dex: Dex::Raydium,
+            input_mint, output_mint, amount_in, min_amount_out, slot,
+        });
+    }
+
     None
 }
