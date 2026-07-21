@@ -82,46 +82,53 @@ impl Executor {
     async fn execute_liquidation(&self, opp: LiqOpportunity) -> Result<()> {
         info!("liq: obligation={} profit={:?}", opp.obligation, opp.adjusted_profit_lamports);
 
-        // BLOCKED, not wired up. real plan below, verified against sources, not guessed:
-        //
-        // 1. ObligationState (state.rs) only carries aggregated collateral_value/borrow_value,
-        //    it doesn't know WHICH reserves are involved. that's the actual gap, not this
-        //    function. Kamino's real on-chain layout (confirmed against Kamino's own docs,
-        //    mintlify.com/kamino-finance/klend/concepts/architecture):
-        //
-        //      pub struct Obligation {
-        //          pub tag: u64,
-        //          pub last_update: LastUpdate,
-        //          pub lending_market: Pubkey,
-        //          pub owner: Pubkey,
-        //          pub deposits: [ObligationCollateral; 8],  // deposit_reserve: Pubkey, deposited_amount: u64, market_value_sf: u128
-        //          pub borrows: [ObligationLiquidity; 5],    // borrow_reserve: Pubkey, borrowed_amount_sf: u128, ...
-        //          pub deposited_value_sf: u128,
-        //          pub borrow_factor_adjusted_debt_value_sf: u128,
-        //          // ... more health/liquidation fields
-        //      }
-        //
-        //    fixed-size arrays, not the dynamic Vec<> layout older forks (Port, Solend) use.
-        //    this also explains the overlapping-offset bug flagged in decode_obligation()
-        //    in monitor.rs: it was hand-decoding against the wrong shape entirely.
-        //
-        // 2. don't hand-roll these offsets either. klend-interface re-exports
-        //    `state::from_account_data` for zero-copy Obligation/Reserve parsing, confirmed
-        //    present in the crate (see Cargo.toml, already added). use that instead of
-        //    byte-offset math in monitor.rs.
-        //
-        // 3. once ObligationState carries real deposit_reserve/borrow_reserve pubkeys,
-        //    LiqOpportunity needs repay_reserve/withdraw_reserve: Pubkey fields (replacing
-        //    the current repay_mint/collateral_mint placeholders in liquidation.rs, which are
-        //    already marked FIXME/wrong), and this function becomes: fetch those reserves +
-        //    obligation via klend_interface::{ObligationContext, ReserveInfo}, then call
-        //    klend_interface::helpers::liquidate::liquidate(...) (signature already confirmed
-        //    against docs.rs, see git history of this function for the attempted wiring).
-        //
-        // the one piece I could NOT verify against source: ObligationInfo's exact constructor
-        // (helpers::info module). confirm that against `cargo doc --open -p klend-interface`
-        // before finishing step 3, don't guess the method name.
-        Err(anyhow::anyhow!("kamino liquidation ix not wired up yet, see plan in execute_liquidation"))
+        use klend_interface::ObligationContext;
+
+        let owner = self.signer.pubkey();
+
+        // 1. fetch the obligation, discover every reserve it references
+        let obligation_account = self.rpc.get_account(&opp.obligation).await
+            .context("fetch obligation account")?;
+        let reserve_addrs = ObligationContext::reserve_addresses_for_obligation(&obligation_account.data)
+            .map_err(|e| anyhow::anyhow!("parse obligation reserve list: {e:?}"))?;
+
+        // 2. fetch all of them in one batched RPC call
+        let reserve_accounts = self.rpc.get_multiple_accounts(&reserve_addrs).await
+            .context("fetch obligation reserves")?;
+        let reserve_data: Vec<(Pubkey, &[u8])> = reserve_addrs.iter()
+            .zip(reserve_accounts.iter())
+            .filter_map(|(addr, acc)| acc.as_ref().map(|a| (*addr, a.data.as_slice())))
+            .collect();
+
+        // 3. build the context, then the liquidate instructions (refreshes prepended automatically)
+        let ctx = ObligationContext::from_account_data(opp.obligation, &obligation_account.data, &reserve_data)
+            .map_err(|e| anyhow::anyhow!("build obligation context: {e:?}"))?;
+
+        // need the repay reserve's liquidity mint to derive our own source ATA, and the
+        // withdraw reserve's collateral mint for the destination. the mint comes straight
+        // out of the reserve account we already fetched, the collateral mint is a PDA off
+        // the reserve pubkey alone, no need to parse the reserve for that part.
+        let repay_mint = ctx.reserve_info(&opp.repay_reserve)
+            .context("repay reserve not present in fetched obligation context")?
+            .liquidity_mint;
+        let (collateral_mint, _) = klend_interface::pda::reserve_collateral_mint(
+            &klend_interface::KLEND_PROGRAM_ID, &opp.withdraw_reserve,
+        );
+
+        let user_source_liquidity      = derive_ata(&owner, &repay_mint)?;
+        let user_destination_collateral = derive_ata(&owner, &collateral_mint)?;
+        let user_destination_liquidity  = derive_ata(&owner, &repay_mint)?; // bonus collateral gets redeemed back to the same liquidity mint on this side of the trade
+
+        // min_received left at 1: this is a liquidation, not a swap, we want it to land even
+        // on a thin bonus rather than revert. real slippage protection belongs in whether we
+        // decided to liquidate at all (see gross_profit_lamports upstream), not here.
+        let ixs = ctx.liquidate(
+            owner, &opp.repay_reserve, &opp.withdraw_reserve,
+            user_source_liquidity, user_destination_collateral, user_destination_liquidity,
+            opp.repay_amount, 1, 0,
+        ).map_err(|e| anyhow::anyhow!("build liquidate instructions: {e:?}"))?;
+
+        self.sim_and_send(ixs).await
     }
 
     async fn execute_sandwich(&self, opp: SandwichOpportunity) -> Result<()> {
