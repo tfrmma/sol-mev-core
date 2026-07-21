@@ -1,10 +1,10 @@
-use solana_sdk::{instruction::{AccountMeta, Instruction}, pubkey::Pubkey};
+use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 use tracing::{debug, info};
 
 use crate::config::BotConfig;
 use crate::risk::RiskEngine;
-use crate::state::{LendingProtocol, ObligationState, PoolState, OBLIGATIONS, POOLS};
+use crate::state::{LendingProtocol, ObligationState, OBLIGATIONS};
 
 #[derive(Debug, Clone)]
 pub struct LiqOpportunity {
@@ -12,10 +12,10 @@ pub struct LiqOpportunity {
     pub protocol:                 LendingProtocol,
     pub owner:                    Pubkey,
     pub repay_amount:             u64,
-    pub repay_mint:               Pubkey,
-    pub collateral_mint:          Pubkey,
+    pub repay_reserve:            Pubkey,
+    pub withdraw_reserve:         Pubkey,
     pub gross_profit_lamports:    i64,
-    pub adjusted_profit_lamports: Option<i64>, // None means risk engine vetoed it
+    pub adjusted_profit_lamports: Option<i64>, // None means risk engine vetoed it, or couldn't be computed
     pub health_factor:            f64,
 }
 
@@ -27,8 +27,16 @@ impl LiqOpportunity {
 
 pub struct LiquidationScanner {
     min_profit: u64,
+    // not read right now either, the actual liquidator pubkey used when building the tx
+    // comes from executor.rs's own signer. kept for the same reason as `risk` above.
+    #[allow(dead_code)]
     liquidator: Pubkey,
-    risk:       Arc<RiskEngine>,
+    // not read right now, see the note in build_opportunity: risk-adjustment needs the
+    // collateral mint, which this sync scanner doesn't have without an extra RPC call.
+    // kept in the constructor signature since callers already pass it and it's the natural
+    // place to restore adjusted_profit_lamports if that RPC round trip gets added later.
+    #[allow(dead_code)]
+    risk: Arc<RiskEngine>,
 }
 
 impl LiquidationScanner {
@@ -67,48 +75,10 @@ impl LiquidationScanner {
         opps
     }
 
-    // NOT WIRED UP YET. leaving the old hand-rolled 2-account stub in place below on purpose,
-    // it's clearly broken and errors loudly instead of silently building a wrong tx.
-    //
-    // the real fix: Kamino publishes an official crate, klend-interface (crates.io, no
-    // anchor-lang dep, targets solana-sdk 2.x, already added to Cargo.toml). it has a
-    // `helpers::liquidate::liquidate(...)` function that returns the *entire* correct
-    // Vec<Instruction> (refreshes + liquidate_and_redeem_v2), fully accounted for. use that
-    // instead of hand-building AccountMetas here.
-    //
-    // problem: this scanner is sync and has no RPC client, but building the real ix needs
-    // live Reserve account data (`ReserveInfo::from_account_data`) for the repay reserve,
-    // the withdraw reserve, and every reserve on the obligation. that means this has to move
-    // into executor.rs::execute_liquidation, which already owns an RpcClient. rough shape:
-    //
-    //   1. klend_interface::ObligationContext::reserve_addresses_for_obligation(&obligation_data)
-    //   2. rpc.get_multiple_accounts(&reserve_addrs) in one batched call
-    //   3. ReserveInfo::from_account_data(pubkey, &data) for repay/withdraw/each obligation reserve
-    //   4. klend_interface::helpers::liquidate::liquidate(liquidator, &repay, &withdraw, &obligation_info,
-    //        &obligation_reserves, user_source_liquidity, user_dest_collateral, user_dest_liquidity,
-    //        opp.repay_amount, min_out, 0, None, None)
-    //
-    // this also fixes the collateral_mint/repay_mint FIXME below for free: klend_interface's
-    // zero-copy state::Obligation gives you the real deposit_reserve/borrow_reserve pubkeys
-    // instead of the owner-as-placeholder hack currently in build_opportunity.
-    pub fn build_kamino_liquidation_ix(&self, opp: &LiqOpportunity) -> Instruction {
-        let program_id: Pubkey = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD".parse().unwrap();
-        // discriminant from idl. if kamino redeploys and changes this we'll find out the hard way.
-        let disc: [u8; 8] = [0xb5, 0xe9, 0x4c, 0xbb, 0x68, 0x91, 0x24, 0x1d];
-        let mut data = disc.to_vec();
-        data.extend_from_slice(&opp.repay_amount.to_le_bytes());
-        data.extend_from_slice(&1u64.to_le_bytes()); // min_acceptable_received_collateral_amount
-        Instruction {
-            program_id,
-            accounts: vec![
-                AccountMeta::new(self.liquidator, true),
-                AccountMeta::new(opp.obligation, false),
-                // deliberately incomplete, see the block comment above. this will fail on-chain,
-                // that's the point, don't fill it in piecemeal, replace the whole thing.
-            ],
-            data,
-        }
-    }
+    // liquidation ix building lives in executor.rs::execute_liquidation now, using the
+    // official klend-interface crate (ObligationContext::liquidate) with real reserve data
+    // fetched over RPC. this scanner stays sync and only decides *whether* and *how much*
+    // to liquidate, not how to build the transaction.
 
     fn build_opportunity(&self, obl: &ObligationState) -> Option<LiqOpportunity> {
         let close_factor = self.close_factor(obl);
@@ -118,23 +88,25 @@ impl LiquidationScanner {
         let collateral   = repay_lamps + repay_lamps * bonus_bps / 10_000;
         let gross        = collateral as i64 - repay_lamps as i64;
 
-        // FIXME: both mints are wrong, need to decode from the obligation's deposit/borrow lists.
-        //        using owner as placeholder so it at least compiles. don't ship this.
-        let collateral_mint = obl.owner;
-        let repay_mint      = obl.owner;
+        // real reserve pubkeys now (from klend_interface's zero-copy Obligation parse in
+        // monitor.rs), not the owner-as-placeholder hack this used to be.
+        let repay_reserve    = obl.top_borrow_reserve;
+        let withdraw_reserve = obl.top_deposit_reserve;
 
-        let adjusted = self.best_exit_pool(collateral_mint).and_then(|pool| {
-            let exit_is_a = pool.token_a_mint == collateral_mint;
-            self.risk.adjusted_profit(gross, collateral_mint, &pool, collateral, exit_is_a)
-        });
+        // NOTE: no risk.adjusted_profit() call here anymore. that needs the collateral mint
+        // to look up an exit pool, and we only have the reserve pubkey at this point, not its
+        // mint, without an extra RPC round trip this sync scanner doesn't have. executor.rs
+        // fetches the real Reserve account anyway before executing, that's the right place
+        // to re-check slippage against gross_profit_lamports if this turns out to matter.
+        let adjusted = None;
 
         Some(LiqOpportunity {
             obligation: obl.obligation_pubkey,
             protocol: obl.protocol.clone(),
             owner: obl.owner,
             repay_amount: repay_lamps,
-            repay_mint,
-            collateral_mint,
+            repay_reserve,
+            withdraw_reserve,
             gross_profit_lamports: gross,
             adjusted_profit_lamports: adjusted,
             health_factor: obl.health_factor(),
@@ -169,18 +141,5 @@ impl LiquidationScanner {
         let excess = ltv.saturating_sub(threshold);
         let range  = 10_000u64.saturating_sub(threshold).max(1);
         (2_000 + excess * 8_000 / range).min(10_000)
-    }
-
-    // find deepest pool for this collateral. deep = less slippage on exit.
-    fn best_exit_pool(&self, mint: Pubkey) -> Option<PoolState> {
-        let mut best: Option<PoolState> = None;
-        let mut best_liq = 0u64;
-        POOLS.for_each(|_, pool| {
-            if pool.token_a_mint == mint || pool.token_b_mint == mint {
-                let liq = pool.reserve_a.min(pool.reserve_b);
-                if liq > best_liq { best_liq = liq; best = Some(pool.clone()); }
-            }
-        });
-        best
     }
 }
