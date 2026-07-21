@@ -123,7 +123,12 @@ impl SandwichDetector {
         if lo < FRONTRUN_FLOOR { None } else { Some(lo) }
     }
 
+    // constant-product simulation only. if pool.clmm is Some (whirlpool), this produces garbage:
+    // reserve_a/reserve_b are 0 for CLMM pools by design (see state.rs), so this would quote a
+    // roughly 1:1 swap regardless of real price. guard against it here instead of silently
+    // corrupting sandwich sizing until CLMM support lands in this module too.
     fn apply_swap(&self, pool: &PoolState, input_mint: Pubkey, amount_in: u64) -> PoolState {
+        debug_assert!(pool.clmm.is_none(), "sandwich apply_swap doesn't support CLMM pools yet");
         let mut p       = pool.clone();
         let fee_factor  = (10_000 - pool.fee_bps as u128) as u128;
         let in_with_fee = amount_in as u128 * fee_factor;
@@ -151,6 +156,6 @@ impl SandwichDetector {
     // scale down frontrun size when volatility is high. simple linear scaling,
     // nothing fancy. sigma*10 gives us something in [0, 0.7] range roughly.
     fn vol_scale(&self, mint: Pubkey) -> f64 {
-        (1.0 - (self.risk.sigma_for(mint) * 10.0).min(0.70)).max(0.30)
+        (1.0_f64 - (self.risk.sigma_for(mint) * 10.0_f64).min(0.70)).max(0.30)
     }
 }
