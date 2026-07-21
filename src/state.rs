@@ -231,6 +231,12 @@ pub struct ObligationState {
     pub collateral_value:          u128,
     pub borrow_value:              u128,
     pub liquidation_threshold_bps: u16,
+    // largest deposit/borrow reserve on this obligation, by value. simplification: a real
+    // optimal liquidation might split across multiple reserves, we just take the biggest one
+    // on each side. good enough for a first cut, not optimal for obligations with several
+    // sizeable positions.
+    pub top_deposit_reserve:       Pubkey,
+    pub top_borrow_reserve:        Pubkey,
     pub slot:                      u64,
 }
 
@@ -309,7 +315,9 @@ mod tests {
             protocol: LendingProtocol::Kamino,
             collateral_value: 1, // tiny collateral
             borrow_value: u128::MAX / 2, // huge debt relative to collateral
-            liquidation_threshold_bps: 8_000, slot: 0,
+            liquidation_threshold_bps: 8_000,
+            top_deposit_reserve: Pubkey::default(), top_borrow_reserve: Pubkey::default(),
+            slot: 0,
         };
         assert_eq!(obl.ltv_bps(), u16::MAX, "should saturate, not wrap to a small number");
     }
@@ -321,7 +329,9 @@ mod tests {
             protocol: LendingProtocol::Solend,
             collateral_value: 0,
             borrow_value: 100,
-            liquidation_threshold_bps: 8_000, slot: 0,
+            liquidation_threshold_bps: 8_000,
+            top_deposit_reserve: Pubkey::default(), top_borrow_reserve: Pubkey::default(),
+            slot: 0,
         };
         assert_eq!(obl.ltv_bps(), u16::MAX);
     }
