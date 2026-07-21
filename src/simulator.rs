@@ -14,7 +14,7 @@ use solana_sdk::{
     transaction::VersionedTransaction,
 };
 use std::{collections::HashMap, sync::{Arc, RwLock}, time::Instant};
-use tracing::{debug, warn};
+use tracing::debug;
 
 #[derive(Debug)]
 pub struct SimResult {
