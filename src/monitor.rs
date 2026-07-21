@@ -47,8 +47,6 @@ static SOLEND_PROGRAM_PK: once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy:
 // Raydium AMM v4 account discriminant, first 8 bytes of the on-chain layout.
 // verify with: solana account <pool> --output json | head. if this changes, raydium redeployed.
 const RAYDIUM_POOL_DISC: [u8; 8] = [0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00];
-// Kamino obligation anchor discriminant (sha256("account:Obligation")[..8])
-const KAMINO_OBLIGATION_DISC: [u8; 8] = [0xca, 0x5d, 0x0c, 0x6b, 0x7e, 0x3d, 0x41, 0x72];
 // minimum sane data sizes, saves us from indexing into garbage buffers
 const RAYDIUM_POOL_MIN_LEN: usize  = 0x1A0;
 const OBLIGATION_MIN_LEN:   usize  = 200;
@@ -348,24 +346,61 @@ fn decode_whirlpool_pool(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<PoolS
 // minimal obligation decode. collateral/borrow at fixed offsets, works for kamino v1 and solend.
 // marginfi has a different layout; add it when we actually need it.
 fn decode_obligation(pubkey: Pubkey, program: &Pubkey, data: &[u8], slot: u64) -> Option<ObligationState> {
+    if program == &*KAMINO_LENDING_PK {
+        return decode_kamino_obligation(pubkey, data, slot);
+    }
+
+    // solend: no anchor discriminant, no official rust crate we could find with the same
+    // rigor as klend-interface. offsets below are unverified, see AUDITORIA.md item 9.
     if data.len() < OBLIGATION_MIN_LEN { return None; }
-
-    // kamino uses anchor discriminants; check before parsing fields
-    let protocol = if program == &*KAMINO_LENDING_PK {
-        if data[..8] != KAMINO_OBLIGATION_DISC { return None; }
-        LendingProtocol::Kamino
-    } else {
-        LendingProtocol::Solend // solend doesn't use anchor discriminants
-    };
-
     let collateral_value = u128::from_le_bytes(data[32..48].try_into().ok()?);
     let borrow_value     = u128::from_le_bytes(data[48..64].try_into().ok()?);
     let owner            = Pubkey::from(<[u8; 32]>::try_from(&data[8..40]).ok()?);
 
     Some(ObligationState {
-        obligation_pubkey: pubkey, owner, protocol,
+        obligation_pubkey: pubkey, owner, protocol: LendingProtocol::Solend,
         collateral_value, borrow_value,
         liquidation_threshold_bps: 8500, // 85% LTV. most markets, not all. good enough for now.
+        top_deposit_reserve: Pubkey::default(), top_borrow_reserve: Pubkey::default(),
+        slot,
+    })
+}
+
+// zero-copy parse via klend-interface, verified against docs.rs/klend-interface (Obligation
+// struct, .deposited_value()/.borrow_factor_adjusted_debt_value()/.is_liquidatable() methods).
+// no more hand-picked byte offsets for kamino, this replaces the old overlapping-offset bug
+// (item #9) entirely.
+fn decode_kamino_obligation(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<ObligationState> {
+    let obl = klend_interface::from_account_data::<klend_interface::state::Obligation>(data).ok()?;
+
+    // largest deposit/borrow by value, see the comment on ObligationState for why we
+    // simplify to a single reserve per side instead of optimizing across all of them.
+    let top_deposit_reserve = obl.deposits.iter()
+        .filter(|d| d.deposit_reserve != Pubkey::default())
+        .max_by_key(|d| d.deposited_amount)
+        .map(|d| d.deposit_reserve)
+        .unwrap_or_default();
+    let top_borrow_reserve = obl.borrows.iter()
+        .filter(|b| b.borrow_reserve != Pubkey::default())
+        .max_by_key(|b| b.borrowed_amount())
+        .map(|b| b.borrow_reserve)
+        .unwrap_or_default();
+
+    if top_deposit_reserve == Pubkey::default() || top_borrow_reserve == Pubkey::default() {
+        return None; // nothing to liquidate against
+    }
+
+    // _sf fields are Q68.60 fixed point, klend_interface::Fraction handles the conversion.
+    // scale to lamports-equivalent (u128) the same way the rest of state.rs expects.
+    let collateral_value: f64 = klend_interface::Fraction::from_bits(obl.deposited_value()).to_num();
+    let borrow_value: f64     = klend_interface::Fraction::from_bits(obl.borrow_factor_adjusted_debt_value()).to_num();
+
+    Some(ObligationState {
+        obligation_pubkey: pubkey, owner: obl.owner, protocol: LendingProtocol::Kamino,
+        collateral_value: (collateral_value * 1e9) as u128,
+        borrow_value: (borrow_value * 1e9) as u128,
+        liquidation_threshold_bps: 8500, // TODO: read the real per-reserve threshold instead of a flat default
+        top_deposit_reserve, top_borrow_reserve,
         slot,
     })
 }
