@@ -344,7 +344,8 @@ impl Executor {
         let ticks_per_array = TICK_ARRAY_SIZE * clmm.tick_spacing as i32;
         let base_start = clmm.tick_current.div_euclid(ticks_per_array) * ticks_per_array;
         let tick_array_pda = |start: i32| -> Result<Pubkey> {
-            let seeds = [b"tick_array".as_ref(), whirlpool.as_ref(), start.to_string().as_bytes()];
+            let start_str = start.to_string();
+            let seeds = [b"tick_array".as_ref(), whirlpool.as_ref(), start_str.as_bytes()];
             Ok(Pubkey::find_program_address(&seeds, &program_id).0)
         };
         // walk outward in the swap direction, same convention the SDK uses for tick_array_1/2.
