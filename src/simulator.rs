@@ -17,6 +17,9 @@ use std::{collections::HashMap, sync::{Arc, RwLock}, time::Instant};
 use tracing::debug;
 
 #[derive(Debug)]
+// logs/elapsed_us are diagnostic, useful when a sim failure needs a closer look but not
+// consumed by any current caller.
+#[allow(dead_code)]
 pub struct SimResult {
     pub units_consumed: u64,
     pub success:        bool,
@@ -60,6 +63,7 @@ impl AccountCache {
         }
     }
 
+    #[allow(dead_code)] // handy for a debug log line, nobody calls it yet
     pub fn len(&self) -> usize { self.0.read().unwrap().len() }
 }
 
@@ -119,6 +123,11 @@ impl RpcSimulator {
 
 pub struct Simulator {
     pub rpc:            RpcSimulator,
+    // populated at startup (see main.rs warm_cache) and kept live by the monitor, but
+    // simulate() below doesn't consult it yet. real improvement pending: pass cached account
+    // states into RpcSimulateTransactionConfig.accounts so simulation can run against our
+    // predicted post-update state instead of whatever's live on the RPC node right this instant.
+    #[allow(dead_code)]
     pub cache:          Arc<AccountCache>,
     pub spam_endpoints: Vec<String>,
 }
