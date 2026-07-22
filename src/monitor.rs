@@ -49,8 +49,11 @@ static SOLEND_PROGRAM_PK: once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy:
 const RAYDIUM_POOL_DISC: [u8; 8] = [0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00];
 // minimum sane data sizes, saves us from indexing into garbage buffers
 const RAYDIUM_POOL_MIN_LEN: usize  = 0x1A0;
-const OBLIGATION_MIN_LEN:   usize  = 200;
 
+// dex/output_mint/slot aren't read by SandwichDetector::evaluate today (it derives what it
+// needs from swap.pool + the registry), kept for logging and for when sandwich detection
+// supports more than one dex at once.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PendingSwap {
     pub signature:      String,
@@ -82,6 +85,9 @@ pub struct Monitor {
 }
 
 impl Monitor {
+    // bare-bones constructor, no strategy hooks wired in. main.rs uses new_with_hooks instead,
+    // this is here for anything that just wants raw account/tx streaming without the rest.
+    #[allow(dead_code)]
     pub fn new(endpoint: &str, token: &str, tx: mpsc::Sender<Opportunity>) -> Self {
         Self {
             endpoint: endpoint.to_string(), token: token.to_string(), tx,
@@ -349,19 +355,73 @@ fn decode_obligation(pubkey: Pubkey, program: &Pubkey, data: &[u8], slot: u64) -
     if program == &*KAMINO_LENDING_PK {
         return decode_kamino_obligation(pubkey, data, slot);
     }
+    decode_solend_obligation(pubkey, data, slot)
+}
 
-    // solend: no anchor discriminant, no official rust crate we could find with the same
-    // rigor as klend-interface. offsets below are unverified, see AUDITORIA.md item 9.
-    if data.len() < OBLIGATION_MIN_LEN { return None; }
-    let collateral_value = u128::from_le_bytes(data[32..48].try_into().ok()?);
-    let borrow_value     = u128::from_le_bytes(data[48..64].try_into().ok()?);
-    let owner            = Pubkey::from(<[u8; 32]>::try_from(&data[8..40]).ok()?);
+// solend obligation layout, verified byte-for-byte against Pack::pack_into_slice /
+// unpack_from_slice in solana-labs/solana-program-library, token-lending/program/src/state/obligation.rs.
+// this is a pre-anchor program (Pack trait, not anchor), no 8-byte discriminant, version is
+// a plain u8 at offset 0. deposits/borrows are variable-length (deposits_len/borrows_len
+// bytes just before the data), not fixed arrays like kamino's, so we walk them instead of
+// indexing straight in.
+const SOLEND_OBLIGATION_LEN: usize = 916; // OBLIGATION_LEN in the source, fixed regardless of actual deposits/borrows count
+const SOLEND_COLLATERAL_LEN: usize = 56;  // 32 (pubkey) + 8 (u64) + 16 (Decimal)
+const SOLEND_LIQUIDITY_LEN:  usize = 80;  // 32 (pubkey) + 16 + 16 + 16 (3 Decimals)
+
+fn decode_solend_obligation(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<ObligationState> {
+    if data.len() < SOLEND_OBLIGATION_LEN { return None; }
+    let version = data[0];
+    if version == 0 { return None; } // UNINITIALIZED_VERSION
+
+    let owner              = Pubkey::try_from(&data[42..74]).ok()?;
+    // Decimal fields are WAD-scaled u128 (the field is literally named e.g. "borrowed_amount_wads"
+    // in the source). we don't need to know the exact WAD constant: every ratio below divides
+    // one Decimal by another of the same scale, so the scale cancels out.
+    let deposited_value        = u128::from_le_bytes(data[74..90].try_into().ok()?);
+    let borrowed_value         = u128::from_le_bytes(data[90..106].try_into().ok()?);
+    let unhealthy_borrow_value = u128::from_le_bytes(data[122..138].try_into().ok()?);
+    let deposits_len = data[138] as usize;
+    let borrows_len   = data[139] as usize;
+
+    // real per-obligation threshold instead of a flat guess: unhealthy_borrow_value is defined
+    // in the source as "the dangerous borrow value at the weighted average liquidation
+    // threshold", i.e. unhealthy_borrow_value = deposited_value * liquidation_threshold.
+    let liquidation_threshold_bps = if deposited_value == 0 {
+        8500 // no deposits yet, arbitrary default, is_underwater() will be false regardless (0/0 handled in ltv_bps)
+    } else {
+        (unhealthy_borrow_value * 10_000 / deposited_value).min(u16::MAX as u128) as u16
+    };
+
+    // walk the variable-length deposits, then borrows, right after the fixed header.
+    let mut offset = 140;
+    let mut top_deposit_reserve = Pubkey::default();
+    let mut top_deposit_amount  = 0u64;
+    for _ in 0..deposits_len {
+        if offset + SOLEND_COLLATERAL_LEN > data.len() { return None; }
+        let reserve = Pubkey::try_from(&data[offset..offset + 32]).ok()?;
+        let amount  = u64::from_le_bytes(data[offset + 32..offset + 40].try_into().ok()?);
+        if amount > top_deposit_amount { top_deposit_amount = amount; top_deposit_reserve = reserve; }
+        offset += SOLEND_COLLATERAL_LEN;
+    }
+    let mut top_borrow_reserve = Pubkey::default();
+    let mut top_borrow_amount  = 0u128;
+    for _ in 0..borrows_len {
+        if offset + SOLEND_LIQUIDITY_LEN > data.len() { return None; }
+        let reserve = Pubkey::try_from(&data[offset..offset + 32]).ok()?;
+        let borrowed_amount_wads = u128::from_le_bytes(data[offset + 48..offset + 64].try_into().ok()?);
+        if borrowed_amount_wads > top_borrow_amount { top_borrow_amount = borrowed_amount_wads; top_borrow_reserve = reserve; }
+        offset += SOLEND_LIQUIDITY_LEN;
+    }
+
+    if top_deposit_reserve == Pubkey::default() || top_borrow_reserve == Pubkey::default() {
+        return None; // nothing to liquidate against
+    }
 
     Some(ObligationState {
         obligation_pubkey: pubkey, owner, protocol: LendingProtocol::Solend,
-        collateral_value, borrow_value,
-        liquidation_threshold_bps: 8500, // 85% LTV. most markets, not all. good enough for now.
-        top_deposit_reserve: Pubkey::default(), top_borrow_reserve: Pubkey::default(),
+        collateral_value: deposited_value, borrow_value: borrowed_value,
+        liquidation_threshold_bps,
+        top_deposit_reserve, top_borrow_reserve,
         slot,
     })
 }
