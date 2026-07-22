@@ -13,9 +13,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use solana_sdk::{
     hash::Hash, pubkey::Pubkey, signature::Keypair, signer::Signer,
-    system_instruction, transaction::VersionedTransaction,
+    transaction::VersionedTransaction,
     message::{v0, VersionedMessage},
 };
+use solana_system_interface::instruction as system_instruction;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -170,6 +171,9 @@ impl JitoClient {
     }
 
     // mostly useful for debugging landed bundles. don't poll in a hot loop.
+    // not called from the main loop yet, useful for manually checking a bundle's fate
+    // (inclusion, rejection, still pending) without waiting on the confirmation race in executor.rs.
+    #[allow(dead_code)]
     pub async fn get_bundle_status(&self, uuid: &str) -> Result<String> {
         let payload = serde_json::json!({
             "jsonrpc": "2.0", "id": 1,
