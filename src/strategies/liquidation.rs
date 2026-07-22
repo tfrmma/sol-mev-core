@@ -6,6 +6,10 @@ use crate::config::BotConfig;
 use crate::risk::RiskEngine;
 use crate::state::{LendingProtocol, ObligationState, OBLIGATIONS};
 
+// protocol/owner/health_factor aren't consumed by executor.rs today (it reads obligation,
+// repay_reserve, withdraw_reserve, repay_amount), kept for logging and for when liquidation
+// support extends beyond Kamino.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct LiqOpportunity {
     pub obligation:               Pubkey,
@@ -62,7 +66,8 @@ impl LiquidationScanner {
         Some(opp)
     }
 
-    // scan everything. called less frequently than evaluate(), don't be ashamed of the O(n).
+    // full sweep over every tracked obligation. slower than evaluate() (O(n)), driven
+    // periodically from main.rs (LIQ_SWEEP_INTERVAL) rather than per-update.
     pub fn scan_all(&self) -> Vec<LiqOpportunity> {
         let mut opps: Vec<_> = OBLIGATIONS.collect_all().into_iter()
             .filter(|o| o.is_underwater())
