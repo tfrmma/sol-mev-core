@@ -19,8 +19,9 @@ use crate::{
     config::BotConfig,
     jito::{JitoBundle, JitoClient},
     registry::{PoolMeta, Registry},
+    risk::RiskEngine,
     simulator::Simulator,
-    state::{Dex, PoolState},
+    state::{Dex, PoolState, POOLS},
     strategies::{
         arbitrage::ArbPath,
         liquidation::LiqOpportunity,
@@ -53,16 +54,17 @@ pub struct Executor {
     signer:    Keypair,
     config:    BotConfig,
     registry:  Registry,
+    risk:      Arc<RiskEngine>,
 }
 
 impl Executor {
-    pub fn new(config: BotConfig, signer: Keypair, simulator: Arc<Simulator>, registry: Registry) -> Self {
+    pub fn new(config: BotConfig, signer: Keypair, simulator: Arc<Simulator>, registry: Registry, risk: Arc<RiskEngine>) -> Self {
         let rpc  = RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
         // wire spam endpoints from simulator into jito client.
         // executor owns the jito client so this is the natural place to plumb them together.
         let jito = JitoClient::new(&config.jito_url, config.max_retries)
             .with_spam_endpoints(simulator.spam_endpoints.clone());
-        Self { rpc, jito, simulator, signer, config, registry }
+        Self { rpc, jito, simulator, signer, config, registry, risk }
     }
 
     pub async fn execute(&self, signal: TradingSignal) -> Result<()> {
@@ -111,13 +113,52 @@ impl Executor {
         let repay_mint = ctx.reserve_info(&opp.repay_reserve)
             .context("repay reserve not present in fetched obligation context")?
             .liquidity_mint;
+        let withdraw_reserve_info = ctx.reserve_info(&opp.withdraw_reserve)
+            .context("withdraw reserve not present in fetched obligation context")?;
+        // liquidate_and_redeem gives us the withdraw reserve's real underlying asset directly,
+        // not a cToken we'd need a separate redeem step for. that's the mint we actually end up
+        // holding, and the one that matters for exit-slippage risk below.
+        let withdraw_liquidity_mint = withdraw_reserve_info.liquidity_mint;
         let (collateral_mint, _) = klend_interface::pda::reserve_collateral_mint(
             &klend_interface::KLEND_PROGRAM_ID, &opp.withdraw_reserve,
         );
 
+        // risk-adjustment, moved here from liquidation.rs's sync scanner (see the comment that
+        // used to be there): now that we have the real withdraw mint from a live reserve fetch,
+        // we can actually look up an exit pool and estimate slippage instead of skipping this.
+        let collateral_amount = (opp.gross_profit_lamports + opp.repay_amount as i64).max(0) as u64;
+        let exit_pool = {
+            let mut best: Option<PoolState> = None;
+            let mut best_liq = 0u64;
+            POOLS.for_each(|_, pool| {
+                if pool.token_a_mint == withdraw_liquidity_mint || pool.token_b_mint == withdraw_liquidity_mint {
+                    let liq = pool.reserve_a.min(pool.reserve_b);
+                    if liq > best_liq { best_liq = liq; best = Some(pool.clone()); }
+                }
+            });
+            best
+        };
+        if let Some(pool) = &exit_pool {
+            let exit_is_a = pool.token_a_mint == withdraw_liquidity_mint;
+            match self.risk.adjusted_profit(opp.gross_profit_lamports, withdraw_liquidity_mint, pool, collateral_amount, exit_is_a) {
+                Some(adjusted) => info!("liq: risk-adjusted profit {adjusted} lamports (gross {})", opp.gross_profit_lamports),
+                None => return Err(anyhow::anyhow!(
+                    "liq: risk engine vetoed obligation {} (circuit breaker or unprofitable after haircut/slippage/fee)",
+                    opp.obligation
+                )),
+            }
+        } else {
+            // no tracked pool for this mint, can't estimate exit cost. proceed on gross profit
+            // alone rather than block every liquidation just because registry.json is thin,
+            // but this is exactly the blind spot risk-adjustment exists to catch, so make noise.
+            warn!("liq: no exit pool found for {withdraw_liquidity_mint}, proceeding on unadjusted gross profit");
+        }
+
         let user_source_liquidity      = derive_ata(&owner, &repay_mint)?;
         let user_destination_collateral = derive_ata(&owner, &collateral_mint)?;
-        let user_destination_liquidity  = derive_ata(&owner, &repay_mint)?; // bonus collateral gets redeemed back to the same liquidity mint on this side of the trade
+        // the redeemed underlying asset lands in withdraw_liquidity_mint, NOT repay_mint,
+        // those only coincide for a same-asset liquidation. got this wrong on the first pass.
+        let user_destination_liquidity  = derive_ata(&owner, &withdraw_liquidity_mint)?;
 
         // min_received left at 1: this is a liquidation, not a swap, we want it to land even
         // on a thin bonus rather than revert. real slippage protection belongs in whether we
@@ -200,6 +241,10 @@ impl Executor {
     }
 
     fn build_arb_ixs(&self, path: &ArbPath) -> Result<Vec<Instruction>> {
+        debug_assert_eq!(
+            path.edges.first().map(|e| e.from_mint), Some(path.input_mint),
+            "ArbPath.input_mint out of sync with its own first edge, scanner bug upstream"
+        );
         let mut ixs    = Vec::new();
         let mut amount = path.optimal_input;
         for edge in &path.edges {
@@ -226,8 +271,18 @@ impl Executor {
             Dex::Raydium       => self.raydium_ix(&meta, input, output, amount_in, min_out),
             Dex::Orca          => self.orca_ix(&meta, input, output, amount_in, min_out),
             Dex::OrcaWhirlpool => self.whirlpool_ix(&meta, pool, input, output, amount_in, min_out),
-            // TODO: Lifinity and Meteora. meteora is a pain because of the dynamic fee model.
-            dex                => Err(anyhow::anyhow!("{dex:?} not implemented")),
+            // Lifinity: no official public source found, only third-party transaction-parser
+            // inference (solparser). that's a plausible account layout, not a verified one,
+            // and not held to the same bar as raydium/whirlpool/orca-legacy above. not
+            // implementing from a guess, even a well-corroborated one.
+            //
+            // Meteora: not one program, three (DAMM v1 stableswap+vaults, DAMM v2 unique
+            // per-pool accounts, DLMM bin-based). DLMM specifically is complex enough that a
+            // dedicated from-scratch Rust port of just its math (solana-dlmm-meteora) calls it
+            // "the still-open math-crate gap in the solana DEX ecosystem" as of when this was
+            // researched. picking one variant to support needs its own registry.rs ProgramKind
+            // split first (today AmmMeteora doesn't distinguish which), not just an ix builder.
+            dex                => Err(anyhow::anyhow!("{dex:?} not implemented, see notes above")),
         }
     }
 
