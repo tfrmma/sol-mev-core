@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 klend-interface = "0.6"
+solana-system-interface   = "1"
 tokio        = { version = "1.38", features = ["full"] }
 tokio-stream = "0.1"
 
