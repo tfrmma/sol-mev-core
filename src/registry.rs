@@ -31,6 +31,10 @@ pub enum ProgramKind {
 }
 
 impl ProgramKind {
+    // not called today, monitor.rs's decoders set PoolState.dex directly per-decoder rather
+    // than going through this. kept for whatever eventually drives dex selection generically
+    // off the registry classification instead of a hardcoded match per decoder function.
+    #[allow(dead_code)]
     pub fn as_dex(&self) -> Option<Dex> {
         match self {
             Self::AmmRaydium       => Some(Dex::Raydium),
@@ -106,6 +110,12 @@ fn prog(id: &str, label: &str, kind: ProgramKind, version: u8) -> ProgramEntry {
     ProgramEntry { program_id: id.into(), label: label.into(), kind, version, enabled: true }
 }
 
+// pools_by_pair / last_reload / and the methods below (program_for_id, needs_reload,
+// pools_for_pair, register_pool) are for two features not wired into main.rs yet: periodic
+// registry.json reload, and auto-registering pools discovered live from account decoding
+// instead of requiring them pre-populated. real features, just not connected to the runtime
+// loop today.
+#[allow(dead_code)]
 pub struct ProgramRegistry {
     programs:           HashMap<Pubkey, ProgramEntry>,
     pools:              HashMap<Pubkey, PoolMeta>,
@@ -114,6 +124,7 @@ pub struct ProgramRegistry {
     last_reload:        Instant,
 }
 
+#[allow(dead_code)]
 impl ProgramRegistry {
     fn from_file(file: RegistryFile) -> Self {
         let mut programs           = HashMap::new();
@@ -166,6 +177,7 @@ impl ProgramRegistry {
 #[derive(Clone)]
 pub struct Registry(pub Arc<RwLock<ProgramRegistry>>);
 
+#[allow(dead_code)]
 impl Registry {
     pub fn load(path: &Path) -> Result<Self> {
         let file  = RegistryFile::load_or_create(path)?;
