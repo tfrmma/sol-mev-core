@@ -49,4 +49,13 @@ impl StrategyEngine {
             Opportunity::PendingSwap(swap)     => self.sandwich.as_ref()?.evaluate(&swap) .map(TradingSignal::Sandwich),
         }
     }
+
+    // full sweep over every tracked obligation, not just the one that triggered an update.
+    // catches positions that were already underwater but haven't had a fresh account update
+    // land recently, evaluate() alone can't see those.
+    pub fn sweep_liquidations(&self) -> Vec<TradingSignal> {
+        self.liq.as_ref()
+            .map(|liq| liq.scan_all().into_iter().map(TradingSignal::Liquidation).collect())
+            .unwrap_or_default()
+    }
 }
