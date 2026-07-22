@@ -129,6 +129,13 @@ pub struct ClmmState {
 
 const Q64: u128 = 1u128 << 64;
 
+// conservative cap on price impact per CLMM quote. we don't have per-tick liquidity data
+// (that needs decoding the actual TickArray accounts, not just the Whirlpool account), so
+// past a certain point we genuinely don't know if liquidity changes underneath us. rather
+// than extrapolate past what we can see, quote_clmm refuses the quote instead. 2% is
+// deliberately tight, most single-tick-range swaps that matter for arb sizing stay well under this.
+const MAX_PRICE_IMPACT_BPS: u128 = 200;
+
 // price impact in bps between two sqrt_price values, direction-agnostic. used to bound
 // quote_clmm to a range we actually have liquidity visibility into.
 fn price_impact_bps(sqrt_price: u128, new_sqrt_price: u128) -> u128 {
@@ -203,13 +210,6 @@ impl PoolState {
     // binary search in arbitrage.rs without a size cap. needs real tick-array walking and
     // unit tests against known pool snapshots before this is fully trustworthy, tracked
     // as a follow-up.
-    // conservative cap on price impact per quote. we don't have per-tick liquidity data
-    // (that needs decoding the actual TickArray accounts, not just the Whirlpool account),
-    // so past a certain point we genuinely don't know if liquidity changes underneath us.
-    // rather than extrapolate past what we can see, refuse the quote. 2% is deliberately
-    // tight, most single-tick-range swaps that matter for arb sizing stay well under this.
-    const MAX_PRICE_IMPACT_BPS: u128 = 200;
-
     fn quote_clmm(&self, c: &ClmmState, amount_in: u64, a_to_b: bool) -> u64 {
         if c.liquidity == 0 || c.sqrt_price == 0 { return 0; }
         let fee_num     = 10_000u128 - self.fee_bps as u128;
