@@ -20,6 +20,9 @@ const FRONTRUN_FLOOR: u64        = 100_000;
 // 3 ixs * ~5k each. rough but close enough
 const FEE_ESTIMATE: i64          = 15_000;
 
+// victim_pool/victim_price_impact_bps/victim_sm_score aren't read by executor.rs (it works
+// off pool_state directly), kept for logging and for tuning the filters in sandwich.rs itself.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct SandwichOpportunity {
     pub victim_sig:              String,
