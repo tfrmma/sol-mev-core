@@ -68,6 +68,7 @@ impl<V: Clone + Send + Sync + 'static> ShardedTable<V> {
         }
     }
 
+    // used by StrategyEngine::sweep_liquidations for the periodic full-obligation-table pass.
     pub fn collect_all(&self) -> Vec<V> {
         let mut out = Vec::with_capacity(NUM_SHARDS * SHARD_INIT_CAP / 4);
         for shard in &self.shards {
@@ -76,6 +77,10 @@ impl<V: Clone + Send + Sync + 'static> ShardedTable<V> {
         out
     }
 
+    // single-key eviction, not called yet: gc_stale() below does its sweeping via retain()
+    // directly. this would matter for reacting to an account-closed event immediately instead
+    // of waiting for the next slot-based GC pass.
+    #[allow(dead_code)]
     pub fn remove(&self, key: &Pubkey) {
         let idx = Self::shard_idx(key);
         self.shards[idx].0.write().unwrap().remove(key);
@@ -104,9 +109,11 @@ impl<V: Clone + Send + Sync + HasSlot + 'static> ShardedTable<V> {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Dex { Raydium, Orca, OrcaWhirlpool, Lifinity, Meteora }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LendingProtocol { Kamino, Solend, MarginFi }
 
@@ -121,6 +128,16 @@ pub struct ClmmState {
 }
 
 const Q64: u128 = 1u128 << 64;
+
+// price impact in bps between two sqrt_price values, direction-agnostic. used to bound
+// quote_clmm to a range we actually have liquidity visibility into.
+fn price_impact_bps(sqrt_price: u128, new_sqrt_price: u128) -> u128 {
+    let diff = sqrt_price.abs_diff(new_sqrt_price);
+    // sqrt_price moves by sqrt(price ratio), so double the bps to approximate price impact
+    // rather than sqrt_price impact. conservative (overestimates), which is the right side
+    // to err on for a rejection threshold.
+    (diff * 10_000 / sqrt_price.max(1)) * 2
+}
 
 #[derive(Debug, Clone)]
 pub struct PoolState {
@@ -186,6 +203,13 @@ impl PoolState {
     // binary search in arbitrage.rs without a size cap. needs real tick-array walking and
     // unit tests against known pool snapshots before this is fully trustworthy, tracked
     // as a follow-up.
+    // conservative cap on price impact per quote. we don't have per-tick liquidity data
+    // (that needs decoding the actual TickArray accounts, not just the Whirlpool account),
+    // so past a certain point we genuinely don't know if liquidity changes underneath us.
+    // rather than extrapolate past what we can see, refuse the quote. 2% is deliberately
+    // tight, most single-tick-range swaps that matter for arb sizing stay well under this.
+    const MAX_PRICE_IMPACT_BPS: u128 = 200;
+
     fn quote_clmm(&self, c: &ClmmState, amount_in: u64, a_to_b: bool) -> u64 {
         if c.liquidity == 0 || c.sqrt_price == 0 { return 0; }
         let fee_num     = 10_000u128 - self.fee_bps as u128;
@@ -201,6 +225,7 @@ impl PoolState {
             let Some(num) = c.liquidity.checked_mul(c.sqrt_price) else { return 0 };
             let new_sqrt_price = num / denom;
             if new_sqrt_price >= c.sqrt_price { return 0; } // no movement, or overflowed into garbage
+            if price_impact_bps(c.sqrt_price, new_sqrt_price) > MAX_PRICE_IMPACT_BPS { return 0; }
             // amount_out (token B) = L * (sqrt_price - new_sqrt_price) / 2^64
             let Some(delta) = c.liquidity.checked_mul(c.sqrt_price - new_sqrt_price) else { return 0 };
             (delta / Q64).min(u64::MAX as u128) as u64
@@ -208,6 +233,7 @@ impl PoolState {
             // adding token B moves price up linearly: new_sqrt_price = sqrt_price + amount*2^64/L
             let Some(scaled) = in_with_fee.checked_mul(Q64) else { return 0 };
             let new_sqrt_price = c.sqrt_price + (scaled / c.liquidity);
+            if price_impact_bps(c.sqrt_price, new_sqrt_price) > MAX_PRICE_IMPACT_BPS { return 0; }
             // amount_out (token A) = L * (new_sqrt_price - sqrt_price) / (sqrt_price * new_sqrt_price) * 2^64
             let Some(num) = c.liquidity.checked_mul(new_sqrt_price - c.sqrt_price) else { return 0 };
             let Some(num) = num.checked_mul(Q64) else { return 0 };
@@ -364,5 +390,19 @@ mod tests {
         assert!(out > 0, "should quote a nonzero amount for a small trade against real liquidity");
         assert!(out <= 1_000, "can't get more out than in at a 1:1 price with zero fee");
         assert!(out > 900, "small trade against large liquidity shouldn't slip this much, got {out}");
+    }
+
+    #[test]
+    fn clmm_quote_rejects_trades_beyond_price_impact_cap() {
+        let sqrt_price_one: u128 = 1u128 << 64;
+        let p = PoolState {
+            pool_id: Pubkey::default(), dex: Dex::OrcaWhirlpool,
+            token_a_mint: Pubkey::default(), token_b_mint: Pubkey::default(),
+            reserve_a: 0, reserve_b: 0, fee_bps: 0, slot: 0,
+            // deliberately thin liquidity relative to the trade size, should move price
+            // past the 2% cap and get rejected rather than return an extrapolated number.
+            clmm: Some(ClmmState { sqrt_price: sqrt_price_one, liquidity: 1_000, tick_current: 0, tick_spacing: 64 }),
+        };
+        assert_eq!(p.quote_a_to_b(1_000_000), 0, "should reject rather than quote past the price impact cap");
     }
 }
