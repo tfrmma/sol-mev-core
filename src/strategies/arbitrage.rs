@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use tracing::info;
 
 use crate::config::BotConfig;
-use crate::state::{PoolState, POOLS};
+use crate::state::{PoolState, CURRENT_SLOT, POOLS};
 
 const PROBE_UNIT: u64    = 1_000_000;  // 1 USDC-sized probe. rate is dimensionless anyway
 const INPUT_FLOOR: u64   = 1_000_000;
@@ -14,6 +14,9 @@ const SIZE_STEP: u64     = 1_000;
 // per-hop cost. 3 ixs + some overhead, rough but consistent
 const FEE_PER_HOP: u64  = 15_000;
 
+// `pool` duplicates `pool_state.pool_id`, kept as a quick accessor without going through
+// the full PoolState when you just need the address (e.g. logging).
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ArbEdge {
     pub pool:       Pubkey,
@@ -23,6 +26,10 @@ pub struct ArbEdge {
     pub pool_state: PoolState,
 }
 
+// gross_output is diagnostic (pre-fee output, useful when comparing against net_profit_lamports
+// in a log line), input_mint is redundant with edges.first().from_mint, see the debug_assert
+// in executor.rs::build_arb_ixs that keeps the two in sync.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct ArbPath {
     pub edges:               Vec<ArbEdge>,
@@ -66,8 +73,16 @@ impl ArbitrageScanner {
 
     fn build_edges(&self) -> Vec<ArbEdge> {
         let mut edges = Vec::with_capacity(POOLS.len() * 2);
+        let current_slot = CURRENT_SLOT.load(std::sync::atomic::Ordering::Relaxed);
         POOLS.for_each(|_, pool| {
-            if pool.reserve_a == 0 || pool.reserve_b == 0 { return; }
+            if pool.is_stale(current_slot) { return; } // was never checked before, stale reserves = bad quotes
+            // reserve_a/reserve_b are 0 by design for CLMM pools (see ClmmState in state.rs),
+            // that's not "no liquidity", check clmm.liquidity instead of the constant-product fields.
+            let has_liquidity = match &pool.clmm {
+                Some(c) => c.liquidity > 0,
+                None    => pool.reserve_a != 0 && pool.reserve_b != 0,
+            };
+            if !has_liquidity { return; }
             let rate_ab = pool.quote_a_to_b(PROBE_UNIT) as f64 / PROBE_UNIT as f64;
             let rate_ba = pool.quote_b_to_a(PROBE_UNIT) as f64 / PROBE_UNIT as f64;
             edges.push(ArbEdge { pool: pool.pool_id, from_mint: pool.token_a_mint, to_mint: pool.token_b_mint, rate: rate_ab, pool_state: pool.clone() });
