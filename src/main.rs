@@ -33,6 +33,9 @@ const SIGNAL_CHAN: usize     = 128;
 const REGISTRY_TTL: Duration = Duration::from_secs(300);
 // GC runs every 30s. at 400ms/slot that's ~75 slots between sweeps, plenty of headroom.
 const GC_INTERVAL: Duration  = Duration::from_secs(30);
+// full obligation sweep, separate from the reactive per-update path in StrategyEngine::process.
+// slower than reactive (O(n) over every tracked obligation), so this doesn't need to run often.
+const LIQ_SWEEP_INTERVAL: Duration = Duration::from_secs(20);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -85,16 +88,27 @@ async fn main() -> Result<()> {
         });
     }
 
-    // strategy engine: opportunity → signal
+    // strategy engine: opportunity → signal, plus a periodic full liquidation sweep
     {
         let (cfg, risk, sm) = (config.clone(), risk.clone(), sm.clone());
         let sig_tx          = sig_tx.clone();
         let mut opp_rx      = opp_rx;
         tokio::spawn(async move {
             let engine = StrategyEngine::new(&cfg, signer_pk, risk, sm);
-            while let Some(opp) = opp_rx.recv().await {
-                if let Some(sig) = engine.process(opp) {
-                    if sig_tx.send(sig).await.is_err() { break; }
+            let mut liq_sweep = tokio::time::interval(LIQ_SWEEP_INTERVAL);
+            loop {
+                tokio::select! {
+                    opp = opp_rx.recv() => {
+                        let Some(opp) = opp else { break };
+                        if let Some(sig) = engine.process(opp) {
+                            if sig_tx.send(sig).await.is_err() { break; }
+                        }
+                    }
+                    _ = liq_sweep.tick() => {
+                        for sig in engine.sweep_liquidations() {
+                            if sig_tx.send(sig).await.is_err() { break; }
+                        }
+                    }
                 }
             }
         });
@@ -102,10 +116,10 @@ async fn main() -> Result<()> {
 
     // executor: signal -> jito bundle (+ rpc spam if configured)
     {
-        let (cfg, sim, reg) = (config.clone(), simulator.clone(), registry.clone());
+        let (cfg, sim, reg, rsk) = (config.clone(), simulator.clone(), registry.clone(), risk.clone());
         tokio::spawn(async move {
             let signer   = cfg.load_keypair().expect("keypair");
-            let executor = Executor::new(cfg, signer, sim, reg);
+            let executor = Executor::new(cfg, signer, sim, reg, rsk);
             while let Some(sig) = sig_rx.recv().await {
                 if let Err(e) = executor.execute(sig).await { error!("executor: {e:#}"); }
             }
