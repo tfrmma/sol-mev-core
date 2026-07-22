@@ -216,6 +216,7 @@ impl Executor {
             .collect();
         let fee = self.simulator.suggest_priority_fee(&accounts).await
             .min(self.config.max_cu_price_microlamports);
+        self.risk.update_fee_p95(fee); // keep the risk engine's profitability estimate current instead of stuck at its startup default
 
         let final_ixs = Simulator::wrap_with_compute_budget(ixs, sim.units_consumed, fee);
         self.bundle_and_send(final_ixs, fee).await
