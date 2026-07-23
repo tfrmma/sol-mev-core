@@ -371,12 +371,10 @@ impl Executor {
     // #[event_cpi] macro appends automatically (standard anchor-lang convention, same on every
     // program using that macro, not meteora-specific).
     //
-    // ONE PLACEHOLDER LEFT: pool_authority is a single global PDA (`address =
-    // const_pda::pool_authority::ID` in their source, not derived per-pool), but I don't have
-    // its actual value confirmed, the source excerpt I got doesn't include const_pda.rs. DO NOT
-    // use this until that's filled in, everything else here is real.
+    // pool_authority derived at runtime via find_program_address, seed confirmed against the
+    // real programs/cp-amm/src/constants.rs (POOL_AUTHORITY_PREFIX = b"pool_authority").
     //
-    // known limitations even once pool_authority is filled in:
+    // known limitations that remain:
     //   - token_a_program/token_b_program default to classic SPL Token below. token2022 pools
     //     need these overridden (the vault's actual owner program), not detected here.
     //   - referral_token_account: per validate_p_accounts, "no referral" means passing the
@@ -384,20 +382,14 @@ impl Executor {
     //   - rate-limiter-mode pools additionally need SYSVAR_INSTRUCTIONS in remaining accounts,
     //     not handled, this will fail on those specific pools until it is.
     //
-    // ALSO: even once pool_authority is filled in, this is unreachable in practice today.
-    // monitor.rs has no decode_meteora_pool, so no PoolState ever gets built with Dex::Meteora,
-    // and this dispatch arm never fires. that decoder is the next real piece, not this function.
+    // ALSO: still unreachable in practice today. monitor.rs has no decode_meteora_pool, so no
+    // PoolState ever gets built with Dex::Meteora, and this dispatch arm never fires. that
+    // decoder is the next real piece, not this function.
     fn meteora_ix(&self, meta: &PoolMeta, input: Pubkey, output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
-        // NOT REAL, deliberately an invalid pubkey string so this fails loudly and immediately
-        // on the .parse() below rather than silently building a wrong, guaranteed-to-revert
-        // transaction with a placeholder that happens to parse. replace with the real
-        // pool_authority PDA (const_pda::pool_authority::ID in Meteora's source) before this
-        // can run. everything else in this function is verified and ready.
-        const POOL_AUTHORITY_NOT_YET_FILLED_IN: &str = "REPLACE_WITH_REAL_pool_authority_PDA";
-        let pool_authority: Pubkey = POOL_AUTHORITY_NOT_YET_FILLED_IN.parse()
-            .context("meteora_ix: pool_authority PDA not filled in yet, see comment above meteora_ix")?;
-
         let program_id = meta.program_pubkey().context("bad program_id in registry")?;
+        // seed verified against programs/cp-amm/src/constants.rs::seeds::POOL_AUTHORITY_PREFIX.
+        // global PDA, not per-pool, same authority for every cp-amm pool on this program.
+        let (pool_authority, _) = Pubkey::find_program_address(&[b"pool_authority"], &program_id);
         let pool       = meta.pool_pubkey().context("bad pool_id in registry")?;
         let vault_a    = meta.vault_a_pk().context("bad token_a_vault in registry")?;
         let vault_b    = meta.vault_b_pk().context("bad token_b_vault in registry")?;
