@@ -272,17 +272,10 @@ impl Executor {
             Dex::Raydium       => self.raydium_ix(&meta, input, output, amount_in, min_out),
             Dex::Orca          => self.orca_ix(&meta, input, output, amount_in, min_out),
             Dex::OrcaWhirlpool => self.whirlpool_ix(&meta, pool, input, output, amount_in, min_out),
-            // Lifinity: no official public source found, only third-party transaction-parser
-            // inference (solparser). that's a plausible account layout, not a verified one,
-            // and not held to the same bar as raydium/whirlpool/orca-legacy above. not
-            // implementing from a guess, even a well-corroborated one.
-            //
-            // Meteora: not one program, three (DAMM v1 stableswap+vaults, DAMM v2 unique
-            // per-pool accounts, DLMM bin-based). DLMM specifically is complex enough that a
-            // dedicated from-scratch Rust port of just its math (solana-dlmm-meteora) calls it
-            // "the still-open math-crate gap in the solana DEX ecosystem" as of when this was
-            // researched. picking one variant to support needs its own registry.rs ProgramKind
-            // split first (today AmmMeteora doesn't distinguish which), not just an ix builder.
+            Dex::Meteora       => self.meteora_ix(&meta, input, output, amount_in, min_out),
+            // Lifinity: no official public source found anywhere (checked Lifinity Labs' own
+            // github org, 5 repos, none of them the swap program itself). only third-party
+            // transaction-parser inference exists (solparser). not implementing from a guess.
             dex                => Err(anyhow::anyhow!("{dex:?} not implemented, see notes above")),
         }
     }
@@ -367,6 +360,74 @@ impl Executor {
             AccountMeta::new_readonly(token_program, false),
             AccountMeta::new_readonly(token_program, false),
             AccountMeta::new_readonly(token_program, false),
+        ];
+
+        Ok(Instruction { program_id, accounts, data })
+    }
+
+    // meteora DAMM v2 (cp-amm) swap, verified against the real SwapCtx account struct (source
+    // provided directly, not searched: programs/cp-amm/src/instructions/ix_swap.rs). 14 accounts:
+    // the 12 named in #[derive(Accounts)] SwapCtx, plus event_authority + program that the
+    // #[event_cpi] macro appends automatically (standard anchor-lang convention, same on every
+    // program using that macro, not meteora-specific).
+    //
+    // ONE PLACEHOLDER LEFT: pool_authority is a single global PDA (`address =
+    // const_pda::pool_authority::ID` in their source, not derived per-pool), but I don't have
+    // its actual value confirmed, the source excerpt I got doesn't include const_pda.rs. DO NOT
+    // use this until that's filled in, everything else here is real.
+    //
+    // known limitations even once pool_authority is filled in:
+    //   - token_a_program/token_b_program default to classic SPL Token below. token2022 pools
+    //     need these overridden (the vault's actual owner program), not detected here.
+    //   - referral_token_account: per validate_p_accounts, "no referral" means passing the
+    //     program's own ID as this account, not omitting it. done below.
+    //   - rate-limiter-mode pools additionally need SYSVAR_INSTRUCTIONS in remaining accounts,
+    //     not handled, this will fail on those specific pools until it is.
+    //
+    // ALSO: even once pool_authority is filled in, this is unreachable in practice today.
+    // monitor.rs has no decode_meteora_pool, so no PoolState ever gets built with Dex::Meteora,
+    // and this dispatch arm never fires. that decoder is the next real piece, not this function.
+    fn meteora_ix(&self, meta: &PoolMeta, input: Pubkey, output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
+        // NOT REAL, deliberately an invalid pubkey string so this fails loudly and immediately
+        // on the .parse() below rather than silently building a wrong, guaranteed-to-revert
+        // transaction with a placeholder that happens to parse. replace with the real
+        // pool_authority PDA (const_pda::pool_authority::ID in Meteora's source) before this
+        // can run. everything else in this function is verified and ready.
+        const POOL_AUTHORITY_NOT_YET_FILLED_IN: &str = "REPLACE_WITH_REAL_pool_authority_PDA";
+        let pool_authority: Pubkey = POOL_AUTHORITY_NOT_YET_FILLED_IN.parse()
+            .context("meteora_ix: pool_authority PDA not filled in yet, see comment above meteora_ix")?;
+
+        let program_id = meta.program_pubkey().context("bad program_id in registry")?;
+        let pool       = meta.pool_pubkey().context("bad pool_id in registry")?;
+        let vault_a    = meta.vault_a_pk().context("bad token_a_vault in registry")?;
+        let vault_b    = meta.vault_b_pk().context("bad token_b_vault in registry")?;
+        let mint_a     = meta.token_a_mint_pk().context("bad token_a_mint in registry")?;
+        let mint_b     = meta.token_b_mint_pk().context("bad token_b_mint in registry")?;
+        let token_program: Pubkey = SPL_TOKEN_PROGRAM_ID.parse()?; // see token2022 caveat above
+        let owner = self.signer.pubkey();
+
+        let (event_authority, _) = Pubkey::find_program_address(&[b"__event_authority"], &program_id);
+
+        const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8]; // sha256("global:swap")[..8]
+        let mut data = SWAP_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_out.to_le_bytes());
+
+        let accounts = vec![
+            AccountMeta::new_readonly(pool_authority, false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(derive_ata(&owner, &input)?, false),
+            AccountMeta::new(derive_ata(&owner, &output)?, false),
+            AccountMeta::new(vault_a, false),
+            AccountMeta::new(vault_b, false),
+            AccountMeta::new_readonly(mint_a, false),
+            AccountMeta::new_readonly(mint_b, false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new(program_id, false), // referral_token_account: "none" sentinel per validate_p_accounts
+            AccountMeta::new_readonly(event_authority, false),
+            AccountMeta::new_readonly(program_id, false),
         ];
 
         Ok(Instruction { program_id, accounts, data })
