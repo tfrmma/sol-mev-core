@@ -26,7 +26,7 @@ pub struct ProgramEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProgramKind {
-    AmmRaydium, AmmOrca, AmmOrcaWhirlpool, AmmLifinity, AmmMeteora,
+    AmmRaydium, AmmOrca, AmmOrcaWhirlpool, AmmMeteora,
     LendingKamino, LendingSolend, LendingMarginFi,
 }
 
@@ -40,7 +40,6 @@ impl ProgramKind {
             Self::AmmRaydium       => Some(Dex::Raydium),
             Self::AmmOrca          => Some(Dex::Orca),
             Self::AmmOrcaWhirlpool => Some(Dex::OrcaWhirlpool),
-            Self::AmmLifinity      => Some(Dex::Lifinity),
             Self::AmmMeteora       => Some(Dex::Meteora),
             _                      => None,
         }
