@@ -1,627 +1,501 @@
-// geyser subscriber. account updates → pool/obligation state.
-// tx updates → smart money classification + pending swap extraction.
-// reconnects forever on error because the stream drops periodically and that's normal.
-//
-// FILTERING STRATEGY:
-//   1. server-side: geyser `owner` filter drops everything not owned by our program IDs.
-//      this is free, the validator does it before the packet hits the network.
-//   2. client-side first gate: check account data length before touching any offsets.
-//   3. discriminant check: first 8 bytes must match the expected account type.
-//      bails out before any field parsing on garbage/unrelated accounts.
-use anyhow::Result;
-use futures::StreamExt;
-use solana_sdk::pubkey::Pubkey;
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
-
-use yellowstone_grpc_client::GeyserGrpcClient;
-use yellowstone_grpc_proto::prelude::{
-    CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
-    SubscribeRequestFilterTransactions,
+// takes a trading signal, builds ixs, sims, sets compute budget, fires off a jito bundle.
+// each strategy has its own ix builder. they're all stubs right now except the skeleton, 
+// real account metas need to be plumbed through from registry.
+use anyhow::{Context, Result};
+use solana_client::nonblocking::rpc_client::RpcClient;
+use solana_sdk::{
+    commitment_config::CommitmentConfig,
+    instruction::{AccountMeta, Instruction},
+    message::{v0, VersionedMessage},
+    pubkey::Pubkey,
+    signature::Keypair,
+    signer::Signer,
+    transaction::VersionedTransaction,
 };
+use std::sync::Arc;
+use tracing::{info, warn};
 
 use crate::{
-    registry::Registry,
+    config::BotConfig,
+    jito::{JitoBundle, JitoClient},
+    registry::{PoolMeta, Registry},
     risk::RiskEngine,
-    simulator::AccountCache,
-    smart_money::SmartMoneyClassifier,
-    state::{ClmmState, Dex, LendingProtocol, ObligationState, PoolState, CURRENT_SLOT, OBLIGATIONS, POOLS},
+    simulator::Simulator,
+    state::{Dex, PoolState, POOLS},
+    strategies::{
+        arbitrage::ArbPath,
+        liquidation::LiqOpportunity,
+        sandwich::SandwichOpportunity,
+        TradingSignal,
+    },
 };
 
-// program IDs, keep in sync with registry.rs defaults
-const RAYDIUM_AMM_V4: &str = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8";
-const ORCA_SWAP_V2:   &str = "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP";
-const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
-const KAMINO_LENDING: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"; // verified against Kamino-Finance/klend README
-const SOLEND_PROGRAM: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
-const METEORA_CPAMM:  &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"; // DAMM v2, verified against Meteora's own docs
+// well-known, program-independent constants. these never change per-pool.
+const SPL_TOKEN_PROGRAM_ID:        &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
+const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+// single global authority shared by every raydium AMM v4 pool, not per-pool.
+// verified against docs.raydium.io/reference/program-addresses.
+const RAYDIUM_AMM_V4_AUTHORITY: &str = "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1";
 
-// parsed once at startup, account updates come in fast enough that we don't want
-// to allocate a String and compare text for every single one.
-static RAYDIUM_AMM_V4_PK: once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| RAYDIUM_AMM_V4.parse().unwrap());
-static ORCA_SWAP_V2_PK:   once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| ORCA_SWAP_V2.parse().unwrap());
-static ORCA_WHIRLPOOL_PK: once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| ORCA_WHIRLPOOL.parse().unwrap());
-static KAMINO_LENDING_PK: once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| KAMINO_LENDING.parse().unwrap());
-static SOLEND_PROGRAM_PK: once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| SOLEND_PROGRAM.parse().unwrap());
-static METEORA_CPAMM_PK:  once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| METEORA_CPAMM.parse().unwrap());
-
-// Raydium AMM v4 account discriminant, first 8 bytes of the on-chain layout.
-// verify with: solana account <pool> --output json | head. if this changes, raydium redeployed.
-const RAYDIUM_POOL_DISC: [u8; 8] = [0x01, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00];
-// minimum sane data sizes, saves us from indexing into garbage buffers
-const RAYDIUM_POOL_MIN_LEN: usize  = 0x1A0;
-
-// dex/output_mint/slot aren't read by SandwichDetector::evaluate today (it derives what it
-// needs from swap.pool + the registry), kept for logging and for when sandwich detection
-// supports more than one dex at once.
-#[allow(dead_code)]
-#[derive(Debug, Clone)]
-pub struct PendingSwap {
-    pub signature:      String,
-    pub user:           Pubkey,
-    pub pool:           Pubkey,
-    pub dex:            Dex,
-    pub input_mint:     Pubkey,
-    pub output_mint:    Pubkey,
-    pub amount_in:      u64,
-    pub min_amount_out: u64,
-    pub slot:           u64,
+// derives a wallet's associated token account without pulling in spl-associated-token-account,
+// which is what dragged us into the whole solana-zk-token-sdk version hell on 1.18. this is just
+// the standard ATA PDA, seeds = [wallet, token_program, mint], nothing exotic.
+fn derive_ata(wallet: &Pubkey, mint: &Pubkey) -> Result<Pubkey> {
+    let token_program: Pubkey = SPL_TOKEN_PROGRAM_ID.parse()?;
+    let ata_program:   Pubkey = ASSOCIATED_TOKEN_PROGRAM_ID.parse()?;
+    let seeds = [wallet.as_ref(), token_program.as_ref(), mint.as_ref()];
+    Ok(Pubkey::find_program_address(&seeds, &ata_program).0)
 }
 
-#[derive(Debug)]
-pub enum Opportunity {
-    PoolUpdated(Pubkey),
-    ObligationUpdated(Pubkey),
-    PendingSwap(PendingSwap),
+pub struct Executor {
+    rpc:       RpcClient,
+    jito:      JitoClient,
+    simulator: Arc<Simulator>,
+    signer:    Keypair,
+    config:    BotConfig,
+    registry:  Registry,
+    risk:      Arc<RiskEngine>,
 }
 
-pub struct Monitor {
-    endpoint:      String,
-    token:         String,
-    tx:            mpsc::Sender<Opportunity>,
-    risk:          Option<Arc<RiskEngine>>,
-    smart_money:   Option<Arc<SmartMoneyClassifier>>,
-    account_cache: Option<Arc<AccountCache>>,
-    registry:      Option<Registry>,
-}
+impl Executor {
+    pub fn new(config: BotConfig, signer: Keypair, simulator: Arc<Simulator>, registry: Registry, risk: Arc<RiskEngine>) -> Self {
+        let rpc  = RpcClient::new_with_commitment(config.rpc_url.clone(), CommitmentConfig::confirmed());
+        // wire spam endpoints from simulator into jito client.
+        // executor owns the jito client so this is the natural place to plumb them together.
+        let jito = JitoClient::new(&config.jito_url, config.max_retries)
+            .with_spam_endpoints(simulator.spam_endpoints.clone());
+        Self { rpc, jito, simulator, signer, config, registry, risk }
+    }
 
-impl Monitor {
-    // bare-bones constructor, no strategy hooks wired in. main.rs uses new_with_hooks instead,
-    // this is here for anything that just wants raw account/tx streaming without the rest.
-    #[allow(dead_code)]
-    pub fn new(endpoint: &str, token: &str, tx: mpsc::Sender<Opportunity>) -> Self {
-        Self {
-            endpoint: endpoint.to_string(), token: token.to_string(), tx,
-            risk: None, smart_money: None, account_cache: None, registry: None,
+    pub async fn execute(&self, signal: TradingSignal) -> Result<()> {
+        match signal {
+            TradingSignal::Arb(path)        => self.execute_arb(path).await,
+            TradingSignal::Liquidation(opp) => self.execute_liquidation(opp).await,
+            TradingSignal::Sandwich(opp)    => self.execute_sandwich(opp).await,
         }
     }
 
-    pub fn new_with_hooks(
-        endpoint:      &str,
-        token:         &str,
-        tx:            mpsc::Sender<Opportunity>,
-        risk:          Arc<RiskEngine>,
-        smart_money:   Arc<SmartMoneyClassifier>,
-        account_cache: Arc<AccountCache>,
-        registry:      Registry,
-    ) -> Self {
-        Self {
-            endpoint: endpoint.to_string(), token: token.to_string(), tx,
-            risk: Some(risk), smart_money: Some(smart_money),
-            account_cache: Some(account_cache), registry: Some(registry),
-        }
+    async fn execute_arb(&self, path: ArbPath) -> Result<()> {
+        info!("arb: {} hops profit={}", path.edges.len(), path.net_profit_lamports);
+        let ixs = self.build_arb_ixs(&path)?;
+        self.sim_and_send(ixs).await
     }
 
-    pub async fn run(&self) -> Result<()> {
-        info!("connecting to geyser {}", self.endpoint);
-        loop {
-            match self.stream_loop().await {
-                Ok(_)  => info!("geyser stream closed, reconnecting"),
-                Err(e) => warn!("geyser error: {e}, reconnecting in 500ms"),
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        }
-    }
+    async fn execute_liquidation(&self, opp: LiqOpportunity) -> Result<()> {
+        info!("liq: obligation={} profit={:?}", opp.obligation, opp.adjusted_profit_lamports);
 
-    async fn stream_loop(&self) -> Result<()> {
-        let mut client = GeyserGrpcClient::build_from_shared(self.endpoint.clone())?
-            .x_token(Some(self.token.clone()))?
-            .tls_config(yellowstone_grpc_client::ClientTlsConfig::new().with_native_roots())?
-            .connect()
-            .await?;
+        use klend_interface::ObligationContext;
 
-        let program_ids = self.registry
-            .as_ref()
-            .map(|r| r.active_program_id_strings())
-            .unwrap_or_else(|| vec![
-                // fallback hardcoded defaults. ugly but fine for dev.
-                RAYDIUM_AMM_V4.to_string(), ORCA_SWAP_V2.to_string(),
-                ORCA_WHIRLPOOL.to_string(), KAMINO_LENDING.to_string(),
-                SOLEND_PROGRAM.to_string(),
-            ]);
+        let owner = self.signer.pubkey();
 
-        // server-side filter: only accounts owned by our AMM/lending programs.
-        // this is the biggest lever, geyser drops the rest before sending anything over gRPC.
-        //
-        // NOTE: memcmp discriminant filters (offset=0, 8-byte match) would further reduce
-        // traffic but the exact proto path varies between yellowstone-grpc versions.
-        // TODO: add memcmp once we pin the yellowstone version and verify the generated types:
-        //   subscribe_request_filter_accounts_filter::Filter::Memcmp with
-        //   SubscribeRequestFilterAccountsFilterMemcmp { offset: 0, data: RAYDIUM_POOL_DISC }
-        let mut accounts_filter = HashMap::new();
+        // 1. fetch the obligation, discover every reserve it references
+        let obligation_account = self.rpc.get_account(&opp.obligation).await
+            .context("fetch obligation account")?;
+        let reserve_addrs = ObligationContext::reserve_addresses_for_obligation(&obligation_account.data)
+            .map_err(|e| anyhow::anyhow!("parse obligation reserve list: {e:?}"))?;
 
-        accounts_filter.insert("raydium_pools".to_string(), SubscribeRequestFilterAccounts {
-            account: vec![],
-            owner:   vec![RAYDIUM_AMM_V4.to_string()],
-            filters: vec![],
-            ..Default::default()
-        });
+        // 2. fetch all of them in one batched RPC call
+        let reserve_accounts = self.rpc.get_multiple_accounts(&reserve_addrs).await
+            .context("fetch obligation reserves")?;
+        let reserve_data: Vec<(Pubkey, &[u8])> = reserve_addrs.iter()
+            .zip(reserve_accounts.iter())
+            .filter_map(|(addr, acc)| acc.as_ref().map(|a| (*addr, a.data.as_slice())))
+            .collect();
 
-        accounts_filter.insert("orca_pools".to_string(), SubscribeRequestFilterAccounts {
-            account: vec![], owner: vec![ORCA_SWAP_V2.to_string(), ORCA_WHIRLPOOL.to_string()],
-            filters: vec![], ..Default::default()
-        });
+        // 3. build the context, then the liquidate instructions (refreshes prepended automatically)
+        let ctx = ObligationContext::from_account_data(opp.obligation, &obligation_account.data, &reserve_data)
+            .map_err(|e| anyhow::anyhow!("build obligation context: {e:?}"))?;
 
-        accounts_filter.insert("obligations".to_string(), SubscribeRequestFilterAccounts {
-            account: vec![], owner: vec![KAMINO_LENDING.to_string(), SOLEND_PROGRAM.to_string()],
-            filters: vec![], ..Default::default()
-        });
+        // need the repay reserve's liquidity mint to derive our own source ATA, and the
+        // withdraw reserve's collateral mint for the destination. the mint comes straight
+        // out of the reserve account we already fetched, the collateral mint is a PDA off
+        // the reserve pubkey alone, no need to parse the reserve for that part.
+        let repay_mint = ctx.reserve_info(&opp.repay_reserve)
+            .context("repay reserve not present in fetched obligation context")?
+            .liquidity_mint;
+        let withdraw_reserve_info = ctx.reserve_info(&opp.withdraw_reserve)
+            .context("withdraw reserve not present in fetched obligation context")?;
+        // liquidate_and_redeem gives us the withdraw reserve's real underlying asset directly,
+        // not a cToken we'd need a separate redeem step for. that's the mint we actually end up
+        // holding, and the one that matters for exit-slippage risk below.
+        let withdraw_liquidity_mint = withdraw_reserve_info.liquidity_mint;
+        let (collateral_mint, _) = klend_interface::pda::reserve_collateral_mint(
+            &klend_interface::KLEND_PROGRAM_ID, &opp.withdraw_reserve,
+        );
 
-        let mut tx_filter = HashMap::new();
-        tx_filter.insert("swap_txs".to_string(), SubscribeRequestFilterTransactions {
-            vote:             Some(false),
-            failed:           Some(false),
-            account_include:  program_ids,
-            account_exclude:  vec![],
-            account_required: vec![],
-            ..Default::default()
-        });
-
-        let request = SubscribeRequest {
-            accounts:    accounts_filter,
-            transactions: tx_filter,
-            commitment:  Some(CommitmentLevel::Processed as i32),
-            ..Default::default()
+        // risk-adjustment, moved here from liquidation.rs's sync scanner (see the comment that
+        // used to be there): now that we have the real withdraw mint from a live reserve fetch,
+        // we can actually look up an exit pool and estimate slippage instead of skipping this.
+        let collateral_amount = (opp.gross_profit_lamports + opp.repay_amount as i64).max(0) as u64;
+        let exit_pool = {
+            let mut best: Option<PoolState> = None;
+            let mut best_liq = 0u64;
+            POOLS.for_each(|_, pool| {
+                if pool.token_a_mint == withdraw_liquidity_mint || pool.token_b_mint == withdraw_liquidity_mint {
+                    let liq = pool.reserve_a.min(pool.reserve_b);
+                    if liq > best_liq { best_liq = liq; best = Some(pool.clone()); }
+                }
+            });
+            best
         };
-
-        let (_, mut stream) = client.subscribe_with_request(Some(request)).await?;
-        info!("geyser stream active");
-
-        while let Some(msg) = stream.next().await {
-            match msg {
-                Ok(update) => {
-                    if let Some(u) = update.update_oneof { self.dispatch(u).await; }
-                }
-                Err(e) => {
-                    error!("stream error: {e}");
-                    return Err(e.into());
-                }
+        if let Some(pool) = &exit_pool {
+            let exit_is_a = pool.token_a_mint == withdraw_liquidity_mint;
+            match self.risk.adjusted_profit(opp.gross_profit_lamports, withdraw_liquidity_mint, pool, collateral_amount, exit_is_a) {
+                Some(adjusted) => info!("liq: risk-adjusted profit {adjusted} lamports (gross {})", opp.gross_profit_lamports),
+                None => return Err(anyhow::anyhow!(
+                    "liq: risk engine vetoed obligation {} (circuit breaker or unprofitable after haircut/slippage/fee)",
+                    opp.obligation
+                )),
             }
+        } else {
+            // no tracked pool for this mint, can't estimate exit cost. proceed on gross profit
+            // alone rather than block every liquidation just because registry.json is thin,
+            // but this is exactly the blind spot risk-adjustment exists to catch, so make noise.
+            warn!("liq: no exit pool found for {withdraw_liquidity_mint}, proceeding on unadjusted gross profit");
         }
+
+        let user_source_liquidity      = derive_ata(&owner, &repay_mint)?;
+        let user_destination_collateral = derive_ata(&owner, &collateral_mint)?;
+        // the redeemed underlying asset lands in withdraw_liquidity_mint, NOT repay_mint,
+        // those only coincide for a same-asset liquidation. got this wrong on the first pass.
+        let user_destination_liquidity  = derive_ata(&owner, &withdraw_liquidity_mint)?;
+
+        // min_received left at 1: this is a liquidation, not a swap, we want it to land even
+        // on a thin bonus rather than revert. real slippage protection belongs in whether we
+        // decided to liquidate at all (see gross_profit_lamports upstream), not here.
+        let ixs = ctx.liquidate(
+            owner, &opp.repay_reserve, &opp.withdraw_reserve,
+            user_source_liquidity, user_destination_collateral, user_destination_liquidity,
+            opp.repay_amount, 1, 0,
+        ).map_err(|e| anyhow::anyhow!("build liquidate instructions: {e:?}"))?;
+
+        self.sim_and_send(ixs).await
+    }
+
+    async fn execute_sandwich(&self, opp: SandwichOpportunity) -> Result<()> {
+        info!("sandwich: victim={} profit={}", opp.victim_sig, opp.estimated_profit);
+        let pool = &opp.pool_state;
+        // 1% slippage tolerance on the frontrun output. don't be too tight or we revert.
+        let front_ix = self.swap_ix(
+            pool, pool.token_a_mint, pool.token_b_mint,
+            opp.frontrun_amount, opp.frontrun_output * 990 / 1000,
+        )?;
+        let back_ix = self.swap_ix(
+            pool, pool.token_b_mint, pool.token_a_mint,
+            opp.frontrun_output, opp.frontrun_amount,
+        )?;
+
+        let blockhash = self.rpc.get_latest_blockhash().await?;
+        let front_tx  = self.sign_tx(vec![front_ix], blockhash).await?;
+        let back_tx   = self.sign_tx(vec![back_ix],  blockhash).await?;
+
+        let bundle = JitoBundle {
+            transactions: vec![front_tx, back_tx],
+            tip_lamports: self.config.jito_tip_lamports,
+        }.attach_tip(&self.signer, blockhash);
+
+        let uuid = self.jito.send_bundle(&bundle).await?;
+        info!("sandwich bundle {uuid}");
         Ok(())
     }
 
-    async fn dispatch(&self, update: yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof) {
-        use yellowstone_grpc_proto::prelude::subscribe_update::UpdateOneof;
-        match update {
-            UpdateOneof::Account(u)     => if let Some(acc) = u.account { self.on_account(u.slot, acc).await; }
-            UpdateOneof::Transaction(u) => if let Some(tx)  = u.transaction { self.on_transaction(u.slot, tx).await; }
-            UpdateOneof::Slot(u)        => { CURRENT_SLOT.store(u.slot, std::sync::atomic::Ordering::Relaxed); }
-            _ => {}
-        }
-    }
-
-    async fn on_account(&self, slot: u64, acc: yellowstone_grpc_proto::prelude::SubscribeUpdateAccountInfo) {
-        let Ok(pubkey) = Pubkey::try_from(acc.pubkey.as_slice()) else { return };
-        let Ok(owner)  = Pubkey::try_from(acc.owner.as_slice())  else { return };
-
-        // apply delta to account cache regardless of account type.
-        // this is the path for state-delta updates: geyser sends the full account data
-        // on every write, so upsert here keeps the sim cache current without a separate fetch.
-        if let Some(ref cache) = self.account_cache {
-            cache.apply_delta(pubkey, acc.lamports, acc.data.clone(), owner);
+    async fn sim_and_send(&self, ixs: Vec<Instruction>) -> Result<()> {
+        if !self.config.simulate_before_send {
+            return self.bundle_and_send(ixs, 100_000).await;
         }
 
-        if is_amm_owner(&owner) {
-            if let Some(pool) = decode_pool(pubkey, &owner, &acc.data, slot) {
-                if let Some(ref risk) = self.risk { risk.on_pool_update(&pool); }
-                POOLS.insert(pubkey, pool);
-                let _ = self.tx.try_send(Opportunity::PoolUpdated(pubkey));
-            }
-        } else if is_lending_owner(&owner) {
-            if let Some(obl) = decode_obligation(pubkey, &owner, &acc.data, slot) {
-                if obl.is_underwater() {
-                    info!("liquidation candidate {} ltv={}", pubkey, obl.ltv_bps());
-                }
-                OBLIGATIONS.insert(pubkey, obl);
-                let _ = self.tx.try_send(Opportunity::ObligationUpdated(pubkey));
-            }
+        let sim = self.simulator.simulate(&self.signer, ixs.clone()).await?;
+        if !sim.success {
+            warn!("preflight failed: {:?}", sim.error);
+            return Err(anyhow::anyhow!("simulation failed, aborting"));
         }
-    }
 
-    async fn on_transaction(
-        &self,
-        slot: u64,
-        tx:   yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo,
-    ) {
-        if let Some(ref sm) = self.smart_money {
-            self.feed_smart_money_classifier(&tx, sm);
-        }
-        if let Some(swap) = extract_pending_swap(slot, &tx, self.registry.as_ref()) {
-            debug!("pending swap pool={}", swap.pool);
-            let _ = self.tx.try_send(Opportunity::PendingSwap(swap));
-        }
-    }
-
-    fn feed_smart_money_classifier(
-        &self,
-        tx: &yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo,
-        sm: &SmartMoneyClassifier,
-    ) {
-        let Some(inner) = tx.transaction.as_ref() else { return };
-        let Some(msg)   = inner.message.as_ref()  else { return };
-        let Some(bytes) = msg.account_keys.first() else { return };
-        let Ok(signer)  = Pubkey::try_from(bytes.as_slice()) else { return };
-
-        let success  = tx.meta.as_ref().map(|m| m.err.is_none()).unwrap_or(false);
-        let cu_used  = tx.meta.as_ref().and_then(|m| m.compute_units_consumed).unwrap_or(0) as u32;
-        let programs: Vec<Pubkey> = msg.account_keys.iter()
-            .filter_map(|b| Pubkey::try_from(b.as_slice()).ok())
+        // deduplicate accounts for priority fee query
+        let accounts: Vec<Pubkey> = ixs.iter()
+            .flat_map(|ix| ix.accounts.iter().map(|m| m.pubkey))
             .collect();
+        let fee = self.simulator.suggest_priority_fee(&accounts).await
+            .min(self.config.max_cu_price_microlamports);
+        self.risk.update_fee_p95(fee); // keep the risk engine's profitability estimate current instead of stuck at its startup default
 
-        sm.observe_tx(signer, success, Pubkey::default(), cu_used, false, &programs);
-    }
-}
-
-fn is_amm_owner(owner: &Pubkey) -> bool {
-    owner == &*RAYDIUM_AMM_V4_PK || owner == &*ORCA_SWAP_V2_PK || owner == &*ORCA_WHIRLPOOL_PK
-        || owner == &*METEORA_CPAMM_PK
-}
-
-fn is_lending_owner(owner: &Pubkey) -> bool {
-    owner == &*KAMINO_LENDING_PK || owner == &*SOLEND_PROGRAM_PK
-}
-
-// unified pool decoder, dispatches by owner program.
-// discriminant check is the first thing we do. cheap comparison before touching any field offsets.
-fn decode_pool(pubkey: Pubkey, owner: &Pubkey, data: &[u8], slot: u64) -> Option<PoolState> {
-    if owner == &*RAYDIUM_AMM_V4_PK {
-        decode_raydium_pool(pubkey, data, slot)
-    } else if owner == &*ORCA_WHIRLPOOL_PK {
-        decode_whirlpool_pool(pubkey, data, slot)
-    } else if owner == &*METEORA_CPAMM_PK {
-        decode_meteora_pool(pubkey, data, slot)
-    } else {
-        // orca legacy (token-swap program): TODO, same story as raydium below but for the
-        // spl-token-swap layout. lower priority, whirlpool has mostly eaten its volume.
-        None
-    }
-}
-
-// hardcoded raydium AMM v4 layout. offsets verified against on-chain IDL, not the docs.
-fn decode_raydium_pool(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<PoolState> {
-    // discriminant check first, bails before any offset math on wrong account types.
-    // this catches fee collector accounts, config accounts, etc that pass the owner filter.
-    if data.len() < RAYDIUM_POOL_MIN_LEN { return None; }
-    if data[..8] != RAYDIUM_POOL_DISC    { return None; }
-
-    let coin_mint = Pubkey::try_from(&data[0xB8..0xD8]).ok()?;
-    let pc_mint   = Pubkey::try_from(&data[0xD8..0xF8]).ok()?;
-    let reserve_a = u64::from_le_bytes(data[0x190..0x198].try_into().ok()?);
-    let reserve_b = u64::from_le_bytes(data[0x198..0x1A0].try_into().ok()?);
-
-    // skip pools with zero reserves, nothing to trade against and they'll spew NaN into the arb graph
-    if reserve_a == 0 || reserve_b == 0 { return None; }
-
-    Some(PoolState {
-        pool_id: pubkey, dex: Dex::Raydium,
-        token_a_mint: coin_mint, token_b_mint: pc_mint,
-        reserve_a, reserve_b, fee_bps: 25, slot,
-        clmm: None,
-    })
-}
-
-// whirlpool account layout, byte offsets verified against
-// orca-so/whirlpools/programs/whirlpool/src/state/whirlpool.rs (anchor, borsh-packed, no padding).
-// discriminant is sha256("account:Whirlpool")[..8], confirmed against the repo's own test.
-const WHIRLPOOL_DISC: [u8; 8] = [0x3f, 0x95, 0xd1, 0x0c, 0xe1, 0x80, 0x63, 0x09];
-const WHIRLPOOL_MIN_LEN: usize = 261; // through fee_growth_global_b, ignoring reward_infos tail
-
-fn decode_whirlpool_pool(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<PoolState> {
-    if data.len() < WHIRLPOOL_MIN_LEN { return None; }
-    if data[..8] != WHIRLPOOL_DISC     { return None; }
-
-    let tick_spacing     = u16::from_le_bytes(data[41..43].try_into().ok()?);
-    let fee_rate         = u16::from_le_bytes(data[45..47].try_into().ok()?);
-    let liquidity        = u128::from_le_bytes(data[49..65].try_into().ok()?);
-    let sqrt_price        = u128::from_le_bytes(data[65..81].try_into().ok()?);
-    let tick_current      = i32::from_le_bytes(data[81..85].try_into().ok()?);
-    let token_mint_a      = Pubkey::try_from(&data[101..133]).ok()?;
-    let token_mint_b      = Pubkey::try_from(&data[181..213]).ok()?;
-
-    // fee_rate is hundredths of a basis point (u16::MAX ~= 6.5%), our fee_bps field is plain bps.
-    let fee_bps = (fee_rate / 100).min(u16::MAX);
-
-    if liquidity == 0 || sqrt_price == 0 { return None; } // no liquidity, nothing to quote against
-
-    Some(PoolState {
-        pool_id: pubkey, dex: Dex::OrcaWhirlpool,
-        token_a_mint: token_mint_a, token_b_mint: token_mint_b,
-        reserve_a: 0, reserve_b: 0, // not meaningful for CLMM, see clmm field instead
-        fee_bps, slot,
-        clmm: Some(ClmmState { sqrt_price, liquidity, tick_current, tick_spacing }),
-    })
-}
-
-// meteora DAMM v2 (cp-amm) Pool account layout, verified against the real
-// programs/cp-amm/src/state/pool.rs source (not searched, provided directly). offsets below
-// cross-checked against the source's own const_assert_eq!(Pool::INIT_SPACE, 1104): computing
-// every field's offset independently landed on exactly 1104 bytes of body after the 8-byte
-// anchor discriminator, matching their assertion exactly.
-//
-// two liquidity models share this one account, picked by collect_fee_mode:
-//   - Compounding (2): CompoundingLiquidity, a real constant-product pool over token_a_amount/
-//     token_b_amount. quotable with our existing constant-product math (reserve_a/reserve_b),
-//     no CLMM needed.
-//   - BothToken (0) / OnlyB (1): ConcentratedLiquidity, ONE bounded price range per pool
-//     [sqrt_min_price, sqrt_max_price] with a single liquidity value across the whole range
-//     (unlike whirlpool, there's no per-tick liquidity change to miss). our existing quote_clmm
-//     formula is exact here, not an approximation, we just don't enforce the pool's own
-//     min/max price bounds, a trade that would push past them just reverts on-chain (protected
-//     by min_amount_out) rather than silently mis-quoting.
-const METEORA_POOL_DISC: [u8; 8] = [0xf1, 0x9a, 0x6d, 0x04, 0x11, 0xb1, 0x6d, 0xbc]; // sha256("account:Pool")[..8]
-const METEORA_POOL_LEN:  usize = 1112; // 8-byte disc + 1104-byte body, matches Pool::INIT_SPACE exactly
-
-fn decode_meteora_pool(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<PoolState> {
-    if data.len() < METEORA_POOL_LEN { return None; }
-    if data[..8] != METEORA_POOL_DISC { return None; }
-
-    let token_a_mint  = Pubkey::try_from(&data[168..200]).ok()?;
-    let token_b_mint  = Pubkey::try_from(&data[200..232]).ok()?;
-    let liquidity     = u128::from_le_bytes(data[360..376].try_into().ok()?);
-    let sqrt_min_price = u128::from_le_bytes(data[424..440].try_into().ok()?);
-    let sqrt_max_price = u128::from_le_bytes(data[440..456].try_into().ok()?);
-    let sqrt_price     = u128::from_le_bytes(data[456..472].try_into().ok()?);
-    let pool_status    = data[481];
-    let collect_fee_mode = data[484];
-    let token_a_amount = u64::from_le_bytes(data[680..688].try_into().ok()?);
-    let token_b_amount = u64::from_le_bytes(data[688..696].try_into().ok()?);
-
-    if pool_status != 0 { return None; } // 0 = Enable, 1 = Disable, don't quote a disabled pool
-    let _ = (sqrt_min_price, sqrt_max_price); // not enforced yet, see comment above
-
-    // fee isn't a single flat value here (base fee scheduler + dynamic fee on top), and reading
-    // it right means decoding the nested PoolFeesStruct/BaseFeeStruct properly. rough constant
-    // for now rather than parsing that whole nested structure just for an estimate.
-    let fee_bps: u16 = 30;
-
-    if collect_fee_mode == 2 {
-        // Compounding: real constant-product reserves, quotable directly.
-        if token_a_amount == 0 || token_b_amount == 0 { return None; }
-        Some(PoolState {
-            pool_id: pubkey, dex: Dex::Meteora,
-            token_a_mint, token_b_mint,
-            reserve_a: token_a_amount, reserve_b: token_b_amount,
-            fee_bps, slot, clmm: None,
-        })
-    } else {
-        // BothToken / OnlyB: single-range concentrated liquidity.
-        if liquidity == 0 || sqrt_price == 0 { return None; }
-        Some(PoolState {
-            pool_id: pubkey, dex: Dex::Meteora,
-            token_a_mint, token_b_mint,
-            reserve_a: 0, reserve_b: 0, // not meaningful here, see clmm field
-            fee_bps, slot,
-            clmm: Some(ClmmState { sqrt_price, liquidity, tick_current: 0, tick_spacing: 1 }),
-        })
-    }
-}
-
-// minimal obligation decode. collateral/borrow at fixed offsets, works for kamino v1 and solend.
-// marginfi has a different layout; add it when we actually need it.
-fn decode_obligation(pubkey: Pubkey, program: &Pubkey, data: &[u8], slot: u64) -> Option<ObligationState> {
-    if program == &*KAMINO_LENDING_PK {
-        return decode_kamino_obligation(pubkey, data, slot);
-    }
-    decode_solend_obligation(pubkey, data, slot)
-}
-
-// solend obligation layout, verified byte-for-byte against Pack::pack_into_slice /
-// unpack_from_slice in solana-labs/solana-program-library, token-lending/program/src/state/obligation.rs.
-// this is a pre-anchor program (Pack trait, not anchor), no 8-byte discriminant, version is
-// a plain u8 at offset 0. deposits/borrows are variable-length (deposits_len/borrows_len
-// bytes just before the data), not fixed arrays like kamino's, so we walk them instead of
-// indexing straight in.
-const SOLEND_OBLIGATION_LEN: usize = 916; // OBLIGATION_LEN in the source, fixed regardless of actual deposits/borrows count
-const SOLEND_COLLATERAL_LEN: usize = 56;  // 32 (pubkey) + 8 (u64) + 16 (Decimal)
-const SOLEND_LIQUIDITY_LEN:  usize = 80;  // 32 (pubkey) + 16 + 16 + 16 (3 Decimals)
-
-fn decode_solend_obligation(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<ObligationState> {
-    if data.len() < SOLEND_OBLIGATION_LEN { return None; }
-    let version = data[0];
-    if version == 0 { return None; } // UNINITIALIZED_VERSION
-
-    let owner              = Pubkey::try_from(&data[42..74]).ok()?;
-    // Decimal fields are WAD-scaled u128 (the field is literally named e.g. "borrowed_amount_wads"
-    // in the source). we don't need to know the exact WAD constant: every ratio below divides
-    // one Decimal by another of the same scale, so the scale cancels out.
-    let deposited_value        = u128::from_le_bytes(data[74..90].try_into().ok()?);
-    let borrowed_value         = u128::from_le_bytes(data[90..106].try_into().ok()?);
-    let unhealthy_borrow_value = u128::from_le_bytes(data[122..138].try_into().ok()?);
-    let deposits_len = data[138] as usize;
-    let borrows_len   = data[139] as usize;
-
-    // real per-obligation threshold instead of a flat guess: unhealthy_borrow_value is defined
-    // in the source as "the dangerous borrow value at the weighted average liquidation
-    // threshold", i.e. unhealthy_borrow_value = deposited_value * liquidation_threshold.
-    let liquidation_threshold_bps = if deposited_value == 0 {
-        8500 // no deposits yet, arbitrary default, is_underwater() will be false regardless (0/0 handled in ltv_bps)
-    } else {
-        (unhealthy_borrow_value * 10_000 / deposited_value).min(u16::MAX as u128) as u16
-    };
-
-    // walk the variable-length deposits, then borrows, right after the fixed header.
-    let mut offset = 140;
-    let mut top_deposit_reserve = Pubkey::default();
-    let mut top_deposit_amount  = 0u64;
-    for _ in 0..deposits_len {
-        if offset + SOLEND_COLLATERAL_LEN > data.len() { return None; }
-        let reserve = Pubkey::try_from(&data[offset..offset + 32]).ok()?;
-        let amount  = u64::from_le_bytes(data[offset + 32..offset + 40].try_into().ok()?);
-        if amount > top_deposit_amount { top_deposit_amount = amount; top_deposit_reserve = reserve; }
-        offset += SOLEND_COLLATERAL_LEN;
-    }
-    let mut top_borrow_reserve = Pubkey::default();
-    let mut top_borrow_amount  = 0u128;
-    for _ in 0..borrows_len {
-        if offset + SOLEND_LIQUIDITY_LEN > data.len() { return None; }
-        let reserve = Pubkey::try_from(&data[offset..offset + 32]).ok()?;
-        let borrowed_amount_wads = u128::from_le_bytes(data[offset + 48..offset + 64].try_into().ok()?);
-        if borrowed_amount_wads > top_borrow_amount { top_borrow_amount = borrowed_amount_wads; top_borrow_reserve = reserve; }
-        offset += SOLEND_LIQUIDITY_LEN;
+        let final_ixs = Simulator::wrap_with_compute_budget(ixs, sim.units_consumed, fee);
+        self.bundle_and_send(final_ixs, fee).await
     }
 
-    if top_deposit_reserve == Pubkey::default() || top_borrow_reserve == Pubkey::default() {
-        return None; // nothing to liquidate against
+    async fn bundle_and_send(&self, ixs: Vec<Instruction>, _fee: u64) -> Result<()> {
+        let blockhash = self.rpc.get_latest_blockhash().await?;
+        let tx        = self.sign_tx(ixs, blockhash).await?;
+        let bundle    = JitoBundle {
+            transactions: vec![tx],
+            tip_lamports: self.config.jito_tip_lamports,
+        }.attach_tip(&self.signer, blockhash);
+        let uuid = self.jito.send_bundle(&bundle).await?;
+        info!("bundle {uuid}");
+        Ok(())
     }
 
-    Some(ObligationState {
-        obligation_pubkey: pubkey, owner, protocol: LendingProtocol::Solend,
-        collateral_value: deposited_value, borrow_value: borrowed_value,
-        liquidation_threshold_bps,
-        top_deposit_reserve, top_borrow_reserve,
-        slot,
-    })
-}
-
-// zero-copy parse via klend-interface, verified against docs.rs/klend-interface (Obligation
-// struct, .deposited_value()/.borrow_factor_adjusted_debt_value()/.is_liquidatable() methods).
-// no more hand-picked byte offsets for kamino, this replaces the old overlapping-offset bug
-// (item #9) entirely.
-fn decode_kamino_obligation(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<ObligationState> {
-    let obl = klend_interface::from_account_data::<klend_interface::state::Obligation>(data).ok()?;
-
-    // largest deposit/borrow by value, see the comment on ObligationState for why we
-    // simplify to a single reserve per side instead of optimizing across all of them.
-    let top_deposit_reserve = obl.deposits.iter()
-        .filter(|d| d.deposit_reserve != Pubkey::default())
-        .max_by_key(|d| d.deposited_amount)
-        .map(|d| d.deposit_reserve)
-        .unwrap_or_default();
-    let top_borrow_reserve = obl.borrows.iter()
-        .filter(|b| b.borrow_reserve != Pubkey::default())
-        .max_by_key(|b| b.borrowed_amount())
-        .map(|b| b.borrow_reserve)
-        .unwrap_or_default();
-
-    if top_deposit_reserve == Pubkey::default() || top_borrow_reserve == Pubkey::default() {
-        return None; // nothing to liquidate against
+    async fn sign_tx(&self, ixs: Vec<Instruction>, blockhash: solana_sdk::hash::Hash) -> Result<VersionedTransaction> {
+        let msg = v0::Message::try_compile(&self.signer.pubkey(), &ixs, &[], blockhash)
+            .context("compile v0 message")?;
+        VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])
+            .context("sign transaction")
     }
 
-    // _sf fields are Q68.60 fixed point, klend_interface::Fraction handles the conversion.
-    // scale to lamports-equivalent (u128) the same way the rest of state.rs expects.
-    let collateral_value: f64 = klend_interface::Fraction::from_bits(obl.deposited_value()).to_num();
-    let borrow_value: f64     = klend_interface::Fraction::from_bits(obl.borrow_factor_adjusted_debt_value()).to_num();
-
-    Some(ObligationState {
-        obligation_pubkey: pubkey, owner: obl.owner, protocol: LendingProtocol::Kamino,
-        collateral_value: (collateral_value * 1e9) as u128,
-        borrow_value: (borrow_value * 1e9) as u128,
-        liquidation_threshold_bps: 8500, // TODO: read the real per-reserve threshold instead of a flat default
-        top_deposit_reserve, top_borrow_reserve,
-        slot,
-    })
-}
-
-// derives a wallet's associated token account, same PDA logic as executor.rs::derive_ata.
-// duplicated here on purpose rather than importing across modules, it's six lines and monitor.rs
-// shouldn't depend on executor.rs. worth pulling into a shared util module if a third copy shows up.
-fn derive_ata(wallet: &Pubkey, mint: &Pubkey) -> Option<Pubkey> {
-    const TOKEN_PROGRAM: &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
-    const ATA_PROGRAM:   &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
-    let token_program: Pubkey = TOKEN_PROGRAM.parse().ok()?;
-    let ata_program:   Pubkey = ATA_PROGRAM.parse().ok()?;
-    let seeds = [wallet.as_ref(), token_program.as_ref(), mint.as_ref()];
-    Some(Pubkey::find_program_address(&seeds, &ata_program).0)
-}
-
-// scans both top-level and inner (CPI) instructions for a raydium SwapBaseInV2. inner instructions
-// matter because most retail volume routes through an aggregator (jupiter) that CPIs into raydium,
-// the top-level instruction is the aggregator's own, not raydium's.
-//
-// note on "pending": solana doesn't have a real mempool, geyser streams transactions at whatever
-// commitment level you subscribed at (processed here, see registry.rs subscribe config). by the
-// time we see this the tx has already landed in a block, just not confirmed yet. sandwiching here
-// means fast-following in the same or next slot via jito bundle, not classic mempool frontrunning.
-//
-// account layout assumed below (SwapBaseInV2, tag 16): verified against raydium-amm's own
-// instruction.rs doc comments, same 8-account layout used in executor.rs::raydium_ix.
-//   0 token program, 1 amm, 2 authority, 3 coin vault, 4 pc vault,
-//   5 user source token account, 6 user destination token account, 7 user wallet (signer)
-fn extract_pending_swap(
-    slot: u64,
-    tx:       &yellowstone_grpc_proto::prelude::SubscribeUpdateTransactionInfo,
-    registry: Option<&Registry>,
-) -> Option<PendingSwap> {
-    let registry = registry?; // no registry, no way to resolve pool -> mints, nothing to do
-    let inner    = tx.transaction.as_ref()?;
-    let sig      = bs58::encode(&tx.signature).into_string();
-    let msg      = inner.message.as_ref()?;
-    let meta     = tx.meta.as_ref();
-
-    // failed txs didn't move the pool, nothing to sandwich
-    if meta.map(|m| m.err.is_some()).unwrap_or(false) { return None; }
-
-    // full account list needs the dynamically-loaded lookup table addresses appended, static
-    // account_keys alone is incomplete for v0 transactions since yellowstone-grpc v3+.
-    let mut keys: Vec<Pubkey> = msg.account_keys.iter()
-        .filter_map(|b| Pubkey::try_from(b.as_slice()).ok())
-        .collect();
-    if let Some(m) = meta {
-        keys.extend(m.loaded_writable_addresses.iter().filter_map(|b| Pubkey::try_from(b.as_slice()).ok()));
-        keys.extend(m.loaded_readonly_addresses.iter().filter_map(|b| Pubkey::try_from(b.as_slice()).ok()));
+    fn build_arb_ixs(&self, path: &ArbPath) -> Result<Vec<Instruction>> {
+        debug_assert_eq!(
+            path.edges.first().map(|e| e.from_mint), Some(path.input_mint),
+            "ArbPath.input_mint out of sync with its own first edge, scanner bug upstream"
+        );
+        let mut ixs    = Vec::new();
+        let mut amount = path.optimal_input;
+        for edge in &path.edges {
+            // 0.5% slippage per hop. tight enough to be safe, loose enough not to clip on variance
+            let expected = if edge.from_mint == edge.pool_state.token_a_mint {
+                edge.pool_state.quote_a_to_b(amount)
+            } else {
+                edge.pool_state.quote_b_to_a(amount)
+            };
+            let min_out = (expected * 995 / 1000).max(1);
+            ixs.push(self.swap_ix(
+                &edge.pool_state,
+                edge.from_mint, edge.to_mint, amount, min_out,
+            )?);
+            amount = expected;
+        }
+        Ok(ixs)
     }
 
-    // (program_id_index, accounts, data) tuples from both top-level and inner instructions
-    let top_level = msg.instructions.iter().map(|ix| (ix.program_id_index, &ix.accounts, &ix.data));
-    let inner_ixs = meta.into_iter()
-        .flat_map(|m| m.inner_instructions.iter())
-        .flat_map(|group| group.instructions.iter())
-        .map(|ix| (ix.program_id_index, &ix.accounts, &ix.data));
+    fn swap_ix(&self, pool: &PoolState, input: Pubkey, output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
+        let meta = self.registry.pool_meta(&pool.pool_id)
+            .with_context(|| format!("no registry entry for pool {}, can't build accounts", pool.pool_id))?;
+        match &pool.dex {
+            Dex::Raydium       => self.raydium_ix(&meta, input, output, amount_in, min_out),
+            Dex::Orca          => self.orca_ix(&meta, input, output, amount_in, min_out),
+            Dex::OrcaWhirlpool => self.whirlpool_ix(&meta, pool, input, output, amount_in, min_out),
+            Dex::Meteora       => self.meteora_ix(&meta, input, output, amount_in, min_out),
+        }
+    }
 
-    for (program_id_index, accounts, data) in top_level.chain(inner_ixs) {
-        let Some(&program_id) = keys.get(program_id_index as usize) else { continue };
-        if program_id != *RAYDIUM_AMM_V4_PK { continue }
-        if data.len() < 17 || data[0] != 16 { continue } // SwapBaseInV2 discriminant
-        if accounts.len() < 8 { continue }
+    // SwapBaseInV2 (tag 16), verified against raydium-io/raydium-amm program/src/instruction.rs.
+    // migrated off the 18-account OpenBook-era layout in sept 2025, this is the current path.
+    //
+    // assumption baked into this: registry.token_a_vault is raydium's "coin" vault and
+    // token_b_vault is "pc" vault, matching whatever order token_a/token_b got assigned when
+    // the pool was registered. if swaps start reverting with a mint mismatch, check that first.
+    fn raydium_ix(&self, meta: &PoolMeta, input: Pubkey, output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
+        let program_id = meta.program_pubkey().context("bad program_id in registry")?;
+        let pool_id     = meta.pool_pubkey().context("bad pool_id in registry")?;
+        let coin_vault  = meta.vault_a_pk().context("bad token_a_vault in registry")?;
+        let pc_vault    = meta.vault_b_pk().context("bad token_b_vault in registry")?;
+        let authority: Pubkey     = RAYDIUM_AMM_V4_AUTHORITY.parse()?;
+        let token_program: Pubkey = SPL_TOKEN_PROGRAM_ID.parse()?;
+        let owner = self.signer.pubkey();
 
-        let acc = |i: usize| accounts.get(i).and_then(|&idx| keys.get(idx as usize)).copied();
-        let (Some(pool), Some(user)) = (acc(1), acc(7)) else { continue };
-        let Some(user_source) = acc(5) else { continue };
+        let mut data = vec![16u8]; // SwapBaseInV2 discriminant
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_out.to_le_bytes());
 
-        let Some(meta) = registry.pool_meta(&pool) else { continue }; // unregistered pool, can't resolve mints
-        let (Some(mint_a), Some(mint_b)) = (meta.token_a_mint_pk(), meta.token_b_mint_pk()) else { continue };
+        let accounts = vec![
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new(pool_id, false),
+            AccountMeta::new_readonly(authority, false),
+            AccountMeta::new(coin_vault, false),
+            AccountMeta::new(pc_vault, false),
+            AccountMeta::new(derive_ata(&owner, &input)?, false),
+            AccountMeta::new(derive_ata(&owner, &output)?, false),
+            AccountMeta::new_readonly(owner, true),
+        ];
 
-        // direction: whichever candidate mint's ATA matches the user's actual source account.
-        // works without an extra RPC round-trip, assumes the swapper used their standard ATA
-        // (true for the overwhelming majority of swaps, aggregators included).
-        let (input_mint, output_mint) = if derive_ata(&user, &mint_a) == Some(user_source) {
-            (mint_a, mint_b)
-        } else if derive_ata(&user, &mint_b) == Some(user_source) {
-            (mint_b, mint_a)
-        } else {
-            continue; // non-standard source account, can't determine direction cheaply, skip
+        Ok(Instruction { program_id, accounts, data })
+    }
+
+    // legacy SPL token-swap program (orca's original AMM, pre-whirlpool). verified against
+    // solana-labs/solana-program-library/token-swap/program/src/instruction.rs: tag=1 (Swap),
+    // data = tag(1) + amount_in(8) + minimum_amount_out(8) = 17 bytes, 13 accounts (+1 optional
+    // host_fee, omitted here).
+    //
+    // needs pool_mint and pool_fee_account, which PoolMeta doesn't have dedicated fields for.
+    // convention: extra_accounts[0] = pool_mint, extra_accounts[1] = pool_fee_account. document
+    // this in registry.json if you're populating orca legacy pools by hand.
+    fn orca_ix(&self, meta: &PoolMeta, input: Pubkey, output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
+        let program_id = meta.program_pubkey().context("bad program_id in registry")?;
+        let swap_pubkey = meta.pool_pubkey().context("bad pool_id in registry")?;
+        let vault_a     = meta.vault_a_pk().context("bad token_a_vault in registry")?;
+        let vault_b     = meta.vault_b_pk().context("bad token_b_vault in registry")?;
+        let mint_a      = meta.token_a_mint_pk().context("bad token_a_mint in registry")?;
+        let _mint_b     = meta.token_b_mint_pk().context("bad token_b_mint in registry")?; // validated, not otherwise needed here
+        let extra = meta.extra_pubkeys();
+        let pool_mint = *extra.first().context("orca legacy pool missing extra_accounts[0]=pool_mint")?;
+        let pool_fee  = *extra.get(1).context("orca legacy pool missing extra_accounts[1]=pool_fee_account")?;
+        let token_program: Pubkey = SPL_TOKEN_PROGRAM_ID.parse()?;
+        let owner = self.signer.pubkey();
+
+        // authority is a PDA seeded on just the swap account, the on-chain nonce was generated
+        // the same way at pool init time, find_program_address reproduces it deterministically.
+        let (authority, _bump) = Pubkey::find_program_address(&[swap_pubkey.as_ref()], &program_id);
+
+        let a_to_b = input == mint_a;
+        let (swap_source, swap_dest) = if a_to_b { (vault_a, vault_b) } else { (vault_b, vault_a) };
+
+        let mut data = vec![1u8]; // SwapInstruction::Swap
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_out.to_le_bytes());
+
+        let accounts = vec![
+            AccountMeta::new_readonly(swap_pubkey, false),
+            AccountMeta::new_readonly(authority, false),
+            AccountMeta::new_readonly(owner, true), // user_transfer_authority: self-signing, no separate delegate
+            AccountMeta::new(derive_ata(&owner, &input)?, false),
+            AccountMeta::new(swap_source, false),
+            AccountMeta::new(swap_dest, false),
+            AccountMeta::new(derive_ata(&owner, &output)?, false),
+            AccountMeta::new(pool_mint, false),
+            AccountMeta::new(pool_fee, false),
+            AccountMeta::new_readonly(input, false),
+            AccountMeta::new_readonly(output, false),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(token_program, false),
+        ];
+
+        Ok(Instruction { program_id, accounts, data })
+    }
+
+    // meteora DAMM v2 (cp-amm) swap, verified against the real SwapCtx account struct (source
+    // provided directly, not searched: programs/cp-amm/src/instructions/ix_swap.rs). 14 accounts:
+    // the 12 named in #[derive(Accounts)] SwapCtx, plus event_authority + program that the
+    // #[event_cpi] macro appends automatically (standard anchor-lang convention, same on every
+    // program using that macro, not meteora-specific).
+    //
+    // pool_authority derived at runtime via find_program_address, seed confirmed against the
+    // real programs/cp-amm/src/constants.rs (POOL_AUTHORITY_PREFIX = b"pool_authority").
+    //
+    // known limitations that remain:
+    //   - token_a_program/token_b_program default to classic SPL Token below. token2022 pools
+    //     need these overridden (the vault's actual owner program), not detected here.
+    //   - referral_token_account: per validate_p_accounts, "no referral" means passing the
+    //     program's own ID as this account, not omitting it. done below.
+    //   - rate-limiter-mode pools additionally need SYSVAR_INSTRUCTIONS in remaining accounts,
+    //     not handled, this will fail on those specific pools until it is.
+    //
+    // ALSO: still unreachable in practice today. monitor.rs has no decode_meteora_pool, so no
+    // PoolState ever gets built with Dex::Meteora, and this dispatch arm never fires. that
+    // decoder is the next real piece, not this function.
+    fn meteora_ix(&self, meta: &PoolMeta, input: Pubkey, output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
+        let program_id = meta.program_pubkey().context("bad program_id in registry")?;
+        // seed verified against programs/cp-amm/src/constants.rs::seeds::POOL_AUTHORITY_PREFIX.
+        // global PDA, not per-pool, same authority for every cp-amm pool on this program.
+        let (pool_authority, _) = Pubkey::find_program_address(&[b"pool_authority"], &program_id);
+        let pool       = meta.pool_pubkey().context("bad pool_id in registry")?;
+        let vault_a    = meta.vault_a_pk().context("bad token_a_vault in registry")?;
+        let vault_b    = meta.vault_b_pk().context("bad token_b_vault in registry")?;
+        let mint_a     = meta.token_a_mint_pk().context("bad token_a_mint in registry")?;
+        let mint_b     = meta.token_b_mint_pk().context("bad token_b_mint in registry")?;
+        let token_program: Pubkey = SPL_TOKEN_PROGRAM_ID.parse()?; // see token2022 caveat above
+        let owner = self.signer.pubkey();
+
+        let (event_authority, _) = Pubkey::find_program_address(&[b"__event_authority"], &program_id);
+
+        const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8]; // sha256("global:swap")[..8]
+        let mut data = SWAP_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_out.to_le_bytes());
+
+        let accounts = vec![
+            AccountMeta::new_readonly(pool_authority, false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(derive_ata(&owner, &input)?, false),
+            AccountMeta::new(derive_ata(&owner, &output)?, false),
+            AccountMeta::new(vault_a, false),
+            AccountMeta::new(vault_b, false),
+            AccountMeta::new_readonly(mint_a, false),
+            AccountMeta::new_readonly(mint_b, false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new(program_id, false), // referral_token_account: "none" sentinel per validate_p_accounts
+            AccountMeta::new_readonly(event_authority, false),
+            AccountMeta::new_readonly(program_id, false),
+        ];
+
+        Ok(Instruction { program_id, accounts, data })
+    }
+
+    // whirlpool swap, verified against orca-so/whirlpools/programs/whirlpool/src/instructions/swap.rs
+    // (main branch). 11 accounts, discriminator computed as sha256("global:swap")[..8] rather than
+    // copied from memory, since that's the one part of an anchor ix nobody should be typing by hand.
+    //
+    // single caveat carried over from quote_clmm in state.rs: this only walks the tick arrays that
+    // contain the pool's *current* tick. if the trade is big enough to cross into the next array,
+    // the swap will still succeed on-chain (the program crosses ticks correctly, it doesn't need our
+    // help there) but our quote_a_to_b sizing upstream in arbitrage.rs was computed assuming no
+    // crossing, so on a big trade the real output may come in worse than what we sized against.
+    fn whirlpool_ix(&self, meta: &PoolMeta, pool: &PoolState, input: Pubkey, output: Pubkey, amount_in: u64, min_out: u64) -> Result<Instruction> {
+        let clmm = pool.clmm.as_ref().context("whirlpool pool_state missing clmm data, decode didn't run?")?;
+        let program_id = meta.program_pubkey().context("bad program_id in registry")?;
+        let whirlpool   = meta.pool_pubkey().context("bad pool_id in registry")?;
+        let vault_a     = meta.vault_a_pk().context("bad token_a_vault in registry")?;
+        let vault_b     = meta.vault_b_pk().context("bad token_b_vault in registry")?;
+        let mint_a      = meta.token_a_mint_pk().context("bad token_a_mint in registry")?;
+        let mint_b      = meta.token_b_mint_pk().context("bad token_b_mint in registry")?;
+        let token_program: Pubkey = SPL_TOKEN_PROGRAM_ID.parse()?;
+        let owner = self.signer.pubkey();
+        let a_to_b = input == mint_a;
+
+        // three tick arrays around the current tick, seeds verified against
+        // instructions/initialize_tick_array.rs: [b"tick_array", whirlpool, start_tick.to_string()].
+        // note the seed is the ascii decimal string of the tick, not raw bytes, an orca quirk.
+        const TICK_ARRAY_SIZE: i32 = 88;
+        let ticks_per_array = TICK_ARRAY_SIZE * clmm.tick_spacing as i32;
+        let base_start = clmm.tick_current.div_euclid(ticks_per_array) * ticks_per_array;
+        let tick_array_pda = |start: i32| -> Result<Pubkey> {
+            let start_str = start.to_string();
+            let seeds = [b"tick_array".as_ref(), whirlpool.as_ref(), start_str.as_bytes()];
+            Ok(Pubkey::find_program_address(&seeds, &program_id).0)
         };
+        // walk outward in the swap direction, same convention the SDK uses for tick_array_1/2.
+        let (start_1, start_2) = if a_to_b {
+            (base_start - ticks_per_array, base_start - 2 * ticks_per_array)
+        } else {
+            (base_start + ticks_per_array, base_start + 2 * ticks_per_array)
+        };
+        let tick_array_0 = tick_array_pda(base_start)?;
+        let tick_array_1 = tick_array_pda(start_1)?;
+        let tick_array_2 = tick_array_pda(start_2)?;
 
-        let amount_in      = u64::from_le_bytes(data[1..9].try_into().ok()?);
-        let min_amount_out = u64::from_le_bytes(data[9..17].try_into().ok()?);
+        let oracle_seeds = [b"oracle".as_ref(), whirlpool.as_ref()];
+        let oracle = Pubkey::find_program_address(&oracle_seeds, &program_id).0;
 
-        return Some(PendingSwap {
-            signature: sig, user, pool, dex: Dex::Raydium,
-            input_mint, output_mint, amount_in, min_amount_out, slot,
-        });
+        // bounds verified against orca-so/whirlpools/programs/whirlpool/src/math/tick_math.rs.
+        // passing 0 here isn't "no limit", it's out of bounds and the program rejects it outright.
+        const MIN_SQRT_PRICE_X64: u128 = 4_295_048_016;
+        const MAX_SQRT_PRICE_X64: u128 = 79_226_673_515_401_279_992_447_579_055;
+        let sqrt_price_limit = if a_to_b { MIN_SQRT_PRICE_X64 } else { MAX_SQRT_PRICE_X64 };
+
+        const SWAP_DISCRIMINATOR: [u8; 8] = [0xf8, 0xc6, 0x9e, 0x91, 0xe1, 0x75, 0x87, 0xc8];
+        let mut data = SWAP_DISCRIMINATOR.to_vec();
+        data.extend_from_slice(&amount_in.to_le_bytes());
+        data.extend_from_slice(&min_out.to_le_bytes());
+        data.extend_from_slice(&sqrt_price_limit.to_le_bytes());
+        data.push(1); // amount_specified_is_input: true, amount_in is exact
+        data.push(a_to_b as u8);
+
+        let accounts = vec![
+            AccountMeta::new_readonly(token_program, false),
+            AccountMeta::new_readonly(owner, true),
+            AccountMeta::new(whirlpool, false),
+            AccountMeta::new(derive_ata(&owner, &mint_a)?, false),
+            AccountMeta::new(vault_a, false),
+            AccountMeta::new(derive_ata(&owner, &mint_b)?, false),
+            AccountMeta::new(vault_b, false),
+            AccountMeta::new(tick_array_0, false),
+            AccountMeta::new(tick_array_1, false),
+            AccountMeta::new(tick_array_2, false),
+            AccountMeta::new_readonly(oracle, false),
+        ];
+
+        let _ = output; // direction comes from a_to_b / meta.token_a_mint, not from comparing to `output`
+
+        Ok(Instruction { program_id, accounts, data })
     }
-
-    None
 }
