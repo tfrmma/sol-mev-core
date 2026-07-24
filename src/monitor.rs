@@ -35,6 +35,7 @@ const ORCA_SWAP_V2:   &str = "9W959DqEETiGZocYWCQPaJ6sBmUzgfxXfqGeTEdp3aQP";
 const ORCA_WHIRLPOOL: &str = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc";
 const KAMINO_LENDING: &str = "KLend2g3cP87fffoy8q1mQqGKjrxjC8boSyAYavgmjD"; // verified against Kamino-Finance/klend README
 const SOLEND_PROGRAM: &str = "So1endDq2YkqhipRh3WViPa8hdiSpxWy6z3Z6tMCpAo";
+const METEORA_CPAMM:  &str = "cpamdpZCGKUy5JxQXB4dcpGPiikHawvSWAd6mEn1sGG"; // DAMM v2, verified against Meteora's own docs
 
 // parsed once at startup, account updates come in fast enough that we don't want
 // to allocate a String and compare text for every single one.
@@ -43,6 +44,7 @@ static ORCA_SWAP_V2_PK:   once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy:
 static ORCA_WHIRLPOOL_PK: once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| ORCA_WHIRLPOOL.parse().unwrap());
 static KAMINO_LENDING_PK: once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| KAMINO_LENDING.parse().unwrap());
 static SOLEND_PROGRAM_PK: once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| SOLEND_PROGRAM.parse().unwrap());
+static METEORA_CPAMM_PK:  once_cell::sync::Lazy<Pubkey> = once_cell::sync::Lazy::new(|| METEORA_CPAMM.parse().unwrap());
 
 // Raydium AMM v4 account discriminant, first 8 bytes of the on-chain layout.
 // verify with: solana account <pool> --output json | head. if this changes, raydium redeployed.
@@ -274,6 +276,7 @@ impl Monitor {
 
 fn is_amm_owner(owner: &Pubkey) -> bool {
     owner == &*RAYDIUM_AMM_V4_PK || owner == &*ORCA_SWAP_V2_PK || owner == &*ORCA_WHIRLPOOL_PK
+        || owner == &*METEORA_CPAMM_PK
 }
 
 fn is_lending_owner(owner: &Pubkey) -> bool {
@@ -287,6 +290,8 @@ fn decode_pool(pubkey: Pubkey, owner: &Pubkey, data: &[u8], slot: u64) -> Option
         decode_raydium_pool(pubkey, data, slot)
     } else if owner == &*ORCA_WHIRLPOOL_PK {
         decode_whirlpool_pool(pubkey, data, slot)
+    } else if owner == &*METEORA_CPAMM_PK {
+        decode_meteora_pool(pubkey, data, slot)
     } else {
         // orca legacy (token-swap program): TODO, same story as raydium below but for the
         // spl-token-swap layout. lower priority, whirlpool has mostly eaten its volume.
@@ -347,6 +352,70 @@ fn decode_whirlpool_pool(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<PoolS
         fee_bps, slot,
         clmm: Some(ClmmState { sqrt_price, liquidity, tick_current, tick_spacing }),
     })
+}
+
+// meteora DAMM v2 (cp-amm) Pool account layout, verified against the real
+// programs/cp-amm/src/state/pool.rs source (not searched, provided directly). offsets below
+// cross-checked against the source's own const_assert_eq!(Pool::INIT_SPACE, 1104): computing
+// every field's offset independently landed on exactly 1104 bytes of body after the 8-byte
+// anchor discriminator, matching their assertion exactly.
+//
+// two liquidity models share this one account, picked by collect_fee_mode:
+//   - Compounding (2): CompoundingLiquidity, a real constant-product pool over token_a_amount/
+//     token_b_amount. quotable with our existing constant-product math (reserve_a/reserve_b),
+//     no CLMM needed.
+//   - BothToken (0) / OnlyB (1): ConcentratedLiquidity, ONE bounded price range per pool
+//     [sqrt_min_price, sqrt_max_price] with a single liquidity value across the whole range
+//     (unlike whirlpool, there's no per-tick liquidity change to miss). our existing quote_clmm
+//     formula is exact here, not an approximation, we just don't enforce the pool's own
+//     min/max price bounds, a trade that would push past them just reverts on-chain (protected
+//     by min_amount_out) rather than silently mis-quoting.
+const METEORA_POOL_DISC: [u8; 8] = [0xf1, 0x9a, 0x6d, 0x04, 0x11, 0xb1, 0x6d, 0xbc]; // sha256("account:Pool")[..8]
+const METEORA_POOL_LEN:  usize = 1112; // 8-byte disc + 1104-byte body, matches Pool::INIT_SPACE exactly
+
+fn decode_meteora_pool(pubkey: Pubkey, data: &[u8], slot: u64) -> Option<PoolState> {
+    if data.len() < METEORA_POOL_LEN { return None; }
+    if data[..8] != METEORA_POOL_DISC { return None; }
+
+    let token_a_mint  = Pubkey::try_from(&data[168..200]).ok()?;
+    let token_b_mint  = Pubkey::try_from(&data[200..232]).ok()?;
+    let liquidity     = u128::from_le_bytes(data[360..376].try_into().ok()?);
+    let sqrt_min_price = u128::from_le_bytes(data[424..440].try_into().ok()?);
+    let sqrt_max_price = u128::from_le_bytes(data[440..456].try_into().ok()?);
+    let sqrt_price     = u128::from_le_bytes(data[456..472].try_into().ok()?);
+    let pool_status    = data[481];
+    let collect_fee_mode = data[484];
+    let token_a_amount = u64::from_le_bytes(data[680..688].try_into().ok()?);
+    let token_b_amount = u64::from_le_bytes(data[688..696].try_into().ok()?);
+
+    if pool_status != 0 { return None; } // 0 = Enable, 1 = Disable, don't quote a disabled pool
+    let _ = (sqrt_min_price, sqrt_max_price); // not enforced yet, see comment above
+
+    // fee isn't a single flat value here (base fee scheduler + dynamic fee on top), and reading
+    // it right means decoding the nested PoolFeesStruct/BaseFeeStruct properly. rough constant
+    // for now rather than parsing that whole nested structure just for an estimate.
+    let fee_bps: u16 = 30;
+
+    if collect_fee_mode == 2 {
+        // Compounding: real constant-product reserves, quotable directly.
+        if token_a_amount == 0 || token_b_amount == 0 { return None; }
+        Some(PoolState {
+            pool_id: pubkey, dex: Dex::Meteora,
+            token_a_mint, token_b_mint,
+            reserve_a: token_a_amount, reserve_b: token_b_amount,
+            fee_bps, slot, clmm: None,
+        })
+    } else {
+        // BothToken / OnlyB: single-range concentrated liquidity.
+        if liquidity == 0 || sqrt_price == 0 { return None; }
+        Some(PoolState {
+            pool_id: pubkey, dex: Dex::Meteora,
+            token_a_mint, token_b_mint,
+            reserve_a: 0, reserve_b: 0, // not meaningful here, see clmm field
+            fee_bps, slot,
+            clmm: Some(ClmmState { sqrt_price, liquidity, tick_current: 0, tick_spacing: 1 }),
+        })
+    }
 }
 
 // minimal obligation decode. collateral/borrow at fixed offsets, works for kamino v1 and solend.
