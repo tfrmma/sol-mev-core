@@ -111,7 +111,7 @@ impl<V: Clone + Send + Sync + HasSlot + 'static> ShardedTable<V> {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Dex { Raydium, Orca, OrcaWhirlpool, Lifinity, Meteora }
+pub enum Dex { Raydium, Orca, OrcaWhirlpool, Meteora }
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
