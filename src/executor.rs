@@ -75,7 +75,11 @@ mod jupiter {
         pub is_signer: bool,
     }
 
+    // deserialized for completeness, deliberately unread: we build our own compute budget
+    // instructions downstream (Simulator::wrap_with_compute_budget) instead of jupiter's,
+    // using both would fight over the same compute budget program ids.
     #[derive(Deserialize)]
+    #[allow(dead_code)]
     pub struct SwapInstructionsResponse {
         #[serde(rename = "computeBudgetInstructions", default)]
         pub compute_budget_instructions: Vec<ApiInstruction>,
