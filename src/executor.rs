@@ -33,6 +33,7 @@ use crate::{
 // well-known, program-independent constants. these never change per-pool.
 const SPL_TOKEN_PROGRAM_ID:        &str = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA";
 const ASSOCIATED_TOKEN_PROGRAM_ID: &str = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL";
+const WRAPPED_SOL_MINT:            &str = "So11111111111111111111111111111111111111112";
 // single global authority shared by every raydium AMM v4 pool, not per-pool.
 // verified against docs.raydium.io/reference/program-addresses.
 const RAYDIUM_AMM_V4_AUTHORITY: &str = "5Q544fKrFoe6tsEbD7S8EmxGTJYAKtTVhAW5Q5pge4j1";
@@ -47,6 +48,105 @@ fn derive_ata(wallet: &Pubkey, mint: &Pubkey) -> Result<Pubkey> {
     Ok(Pubkey::find_program_address(&seeds, &ata_program).0)
 }
 
+// jupiter aggregator, used as a fallback swap builder for legs where we don't have a direct
+// DEX integration (or no tracked pool for the mint), NOT for arb/sandwich detection itself.
+// an HTTP round trip has no place in the hot detection loop, this is only ever called once
+// we've already decided what to swap and just need a route.
+//
+// response shape verified against developers.jup.ag/docs/swap/build (official docs): each
+// instruction is {programId, accounts: [{pubkey, isWritable, isSigner}], data: base64}.
+mod jupiter {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    pub struct ApiInstruction {
+        #[serde(rename = "programId")]
+        pub program_id: String,
+        pub accounts: Vec<ApiAccountMeta>,
+        pub data: String, // base64
+    }
+
+    #[derive(Deserialize)]
+    pub struct ApiAccountMeta {
+        pub pubkey: String,
+        #[serde(rename = "isWritable")]
+        pub is_writable: bool,
+        #[serde(rename = "isSigner")]
+        pub is_signer: bool,
+    }
+
+    #[derive(Deserialize)]
+    pub struct SwapInstructionsResponse {
+        #[serde(rename = "computeBudgetInstructions", default)]
+        pub compute_budget_instructions: Vec<ApiInstruction>,
+        #[serde(rename = "setupInstructions", default)]
+        pub setup_instructions: Vec<ApiInstruction>,
+        #[serde(rename = "swapInstruction")]
+        pub swap_instruction: ApiInstruction,
+        #[serde(rename = "cleanupInstruction")]
+        pub cleanup_instruction: Option<ApiInstruction>,
+        #[serde(rename = "addressLookupTableAddresses", default)]
+        pub address_lookup_table_addresses: Vec<String>,
+    }
+}
+
+impl Executor {
+    // quote + swap-instructions against Jupiter's public API. slippage_bps is the max we'll
+    // accept, amount_in is exact-in. does NOT include jupiter's own computeBudget instructions,
+    // we build our own via Simulator::wrap_with_compute_budget downstream, using theirs would
+    // fight ours over the same compute budget program ids.
+    //
+    // caller is responsible for resolving any address_lookup_table_addresses this returns into
+    // AddressLookupTableAccounts before building a v0 message, this function only returns the
+    // raw instruction list plus the ALT addresses so building the message stays in one place
+    // (sim_and_send already knows how to build a message, better not to duplicate that here).
+    async fn jupiter_swap_ixs(
+        &self, input_mint: Pubkey, output_mint: Pubkey, amount_in: u64, slippage_bps: u16,
+    ) -> Result<(Vec<Instruction>, Vec<Pubkey>)> {
+        let owner = self.signer.pubkey();
+
+        let quote: serde_json::Value = self.http.get("https://api.jup.ag/swap/v1/quote")
+            .query(&[
+                ("inputMint", input_mint.to_string()),
+                ("outputMint", output_mint.to_string()),
+                ("amount", amount_in.to_string()),
+                ("slippageBps", slippage_bps.to_string()),
+            ])
+            .send().await.context("jupiter /quote request")?
+            .error_for_status().context("jupiter /quote returned an error status")?
+            .json().await.context("parse jupiter /quote response")?;
+
+        let resp: jupiter::SwapInstructionsResponse = self.http
+            .post("https://api.jup.ag/swap/v1/swap-instructions")
+            .json(&serde_json::json!({ "quoteResponse": quote, "userPublicKey": owner.to_string() }))
+            .send().await.context("jupiter /swap-instructions request")?
+            .error_for_status().context("jupiter /swap-instructions returned an error status")?
+            .json().await.context("parse jupiter /swap-instructions response")?;
+
+        let to_ix = |api: &jupiter::ApiInstruction| -> Result<Instruction> {
+            let program_id: Pubkey = api.program_id.parse().context("bad programId in jupiter response")?;
+            let accounts = api.accounts.iter().map(|a| {
+                let pubkey: Pubkey = a.pubkey.parse().context("bad account pubkey in jupiter response")?;
+                Ok(AccountMeta { pubkey, is_signer: a.is_signer, is_writable: a.is_writable })
+            }).collect::<Result<Vec<_>>>()?;
+            let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &api.data)
+                .context("bad base64 instruction data in jupiter response")?;
+            Ok(Instruction { program_id, accounts, data })
+        };
+
+        let mut ixs = Vec::new();
+        for api in &resp.setup_instructions { ixs.push(to_ix(api)?); }
+        ixs.push(to_ix(&resp.swap_instruction)?);
+        if let Some(api) = &resp.cleanup_instruction { ixs.push(to_ix(api)?); }
+
+        let alts = resp.address_lookup_table_addresses.iter()
+            .map(|s| s.parse::<Pubkey>().context("bad lookup table address in jupiter response"))
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok((ixs, alts))
+    }
+}
+
 pub struct Executor {
     rpc:       RpcClient,
     jito:      JitoClient,
@@ -55,6 +155,7 @@ pub struct Executor {
     config:    BotConfig,
     registry:  Registry,
     risk:      Arc<RiskEngine>,
+    http:      reqwest::Client,
 }
 
 impl Executor {
@@ -64,7 +165,8 @@ impl Executor {
         // executor owns the jito client so this is the natural place to plumb them together.
         let jito = JitoClient::new(&config.jito_url, config.max_retries)
             .with_spam_endpoints(simulator.spam_endpoints.clone());
-        Self { rpc, jito, simulator, signer, config, registry, risk }
+        let http = reqwest::Client::new();
+        Self { rpc, jito, simulator, signer, config, registry, risk, http }
     }
 
     pub async fn execute(&self, signal: TradingSignal) -> Result<()> {
@@ -138,6 +240,9 @@ impl Executor {
             });
             best
         };
+        let mut exit_ixs: Vec<Instruction> = Vec::new();
+        let mut exit_luts: Vec<Pubkey> = Vec::new();
+
         if let Some(pool) = &exit_pool {
             let exit_is_a = pool.token_a_mint == withdraw_liquidity_mint;
             match self.risk.adjusted_profit(opp.gross_profit_lamports, withdraw_liquidity_mint, pool, collateral_amount, exit_is_a) {
@@ -148,10 +253,23 @@ impl Executor {
                 )),
             }
         } else {
-            // no tracked pool for this mint, can't estimate exit cost. proceed on gross profit
-            // alone rather than block every liquidation just because registry.json is thin,
-            // but this is exactly the blind spot risk-adjustment exists to catch, so make noise.
-            warn!("liq: no exit pool found for {withdraw_liquidity_mint}, proceeding on unadjusted gross profit");
+            // no tracked pool for this mint. rather than proceed blind (the old behavior here),
+            // ask jupiter for a real route and quote. jupiter aggregates across every dex it
+            // integrates, including ones we don't have our own decoder for, so this covers a lot
+            // more ground than waiting on registry.json to grow. this is an HTTP round trip, but
+            // it's on the exit leg of a liquidation, not the hot arb/sandwich detection path, the
+            // latency doesn't matter here the way it would there.
+            let sol_mint: Pubkey = WRAPPED_SOL_MINT.parse().context("bad WRAPPED_SOL_MINT constant")?;
+            if withdraw_liquidity_mint == sol_mint {
+                // already holding what we want, nothing to swap
+            } else {
+                let (jup_ixs, jup_luts) = self.jupiter_swap_ixs(
+                    withdraw_liquidity_mint, sol_mint, collateral_amount, 100, // 1% slippage
+                ).await.context("liq: no tracked exit pool and jupiter couldn't route this mint either, aborting rather than proceed blind")?;
+                info!("liq: no tracked pool for {withdraw_liquidity_mint}, routing exit through jupiter instead");
+                exit_ixs = jup_ixs;
+                exit_luts = jup_luts;
+            }
         }
 
         let user_source_liquidity      = derive_ata(&owner, &repay_mint)?;
@@ -163,13 +281,18 @@ impl Executor {
         // min_received left at 1: this is a liquidation, not a swap, we want it to land even
         // on a thin bonus rather than revert. real slippage protection belongs in whether we
         // decided to liquidate at all (see gross_profit_lamports upstream), not here.
-        let ixs = ctx.liquidate(
+        let mut ixs = ctx.liquidate(
             owner, &opp.repay_reserve, &opp.withdraw_reserve,
             user_source_liquidity, user_destination_collateral, user_destination_liquidity,
             opp.repay_amount, 1, 0,
         ).map_err(|e| anyhow::anyhow!("build liquidate instructions: {e:?}"))?;
 
-        self.sim_and_send(ixs).await
+        // exit leg tacked onto the same transaction, atomic with the liquidation itself, no
+        // window where we're holding an asset we didn't mean to hold if the exit alone had to
+        // land separately.
+        ixs.extend(exit_ixs);
+
+        self.sim_and_send_with_luts(ixs, &exit_luts).await
     }
 
     async fn execute_sandwich(&self, opp: SandwichOpportunity) -> Result<()> {
@@ -186,8 +309,8 @@ impl Executor {
         )?;
 
         let blockhash = self.rpc.get_latest_blockhash().await?;
-        let front_tx  = self.sign_tx(vec![front_ix], blockhash).await?;
-        let back_tx   = self.sign_tx(vec![back_ix],  blockhash).await?;
+        let front_tx  = self.sign_tx(vec![front_ix], blockhash, &[]).await?;
+        let back_tx   = self.sign_tx(vec![back_ix],  blockhash, &[]).await?;
 
         let bundle = JitoBundle {
             transactions: vec![front_tx, back_tx],
@@ -200,8 +323,12 @@ impl Executor {
     }
 
     async fn sim_and_send(&self, ixs: Vec<Instruction>) -> Result<()> {
+        self.sim_and_send_with_luts(ixs, &[]).await
+    }
+
+    async fn sim_and_send_with_luts(&self, ixs: Vec<Instruction>, lookup_tables: &[Pubkey]) -> Result<()> {
         if !self.config.simulate_before_send {
-            return self.bundle_and_send(ixs, 100_000).await;
+            return self.bundle_and_send(ixs, 100_000, lookup_tables).await;
         }
 
         let sim = self.simulator.simulate(&self.signer, ixs.clone()).await?;
@@ -219,12 +346,12 @@ impl Executor {
         self.risk.update_fee_p95(fee); // keep the risk engine's profitability estimate current instead of stuck at its startup default
 
         let final_ixs = Simulator::wrap_with_compute_budget(ixs, sim.units_consumed, fee);
-        self.bundle_and_send(final_ixs, fee).await
+        self.bundle_and_send(final_ixs, fee, lookup_tables).await
     }
 
-    async fn bundle_and_send(&self, ixs: Vec<Instruction>, _fee: u64) -> Result<()> {
+    async fn bundle_and_send(&self, ixs: Vec<Instruction>, _fee: u64, lookup_tables: &[Pubkey]) -> Result<()> {
         let blockhash = self.rpc.get_latest_blockhash().await?;
-        let tx        = self.sign_tx(ixs, blockhash).await?;
+        let tx        = self.sign_tx(ixs, blockhash, lookup_tables).await?;
         let bundle    = JitoBundle {
             transactions: vec![tx],
             tip_lamports: self.config.jito_tip_lamports,
@@ -234,11 +361,33 @@ impl Executor {
         Ok(())
     }
 
-    async fn sign_tx(&self, ixs: Vec<Instruction>, blockhash: solana_sdk::hash::Hash) -> Result<VersionedTransaction> {
-        let msg = v0::Message::try_compile(&self.signer.pubkey(), &ixs, &[], blockhash)
+    async fn sign_tx(&self, ixs: Vec<Instruction>, blockhash: solana_sdk::hash::Hash, lookup_tables: &[Pubkey]) -> Result<VersionedTransaction> {
+        let resolved = self.resolve_lookup_tables(lookup_tables).await?;
+        let msg = v0::Message::try_compile(&self.signer.pubkey(), &ixs, &resolved, blockhash)
             .context("compile v0 message")?;
         VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&self.signer])
             .context("sign transaction")
+    }
+
+    // fetches and deserializes each lookup table account so try_compile can resolve indices
+    // into real pubkeys. only needed for routes that reference one (jupiter's swap-instructions
+    // frequently does, our own hand-built ix's never do since we never use lookup tables
+    // ourselves).
+    async fn resolve_lookup_tables(&self, lookup_tables: &[Pubkey]) -> Result<Vec<solana_sdk::address_lookup_table::AddressLookupTableAccount>> {
+        if lookup_tables.is_empty() { return Ok(Vec::new()); }
+        let accounts = self.rpc.get_multiple_accounts(lookup_tables).await
+            .context("fetch address lookup table accounts")?;
+        let mut out = Vec::with_capacity(lookup_tables.len());
+        for (key, acc) in lookup_tables.iter().zip(accounts.iter()) {
+            let Some(acc) = acc else { continue }; // closed/missing lookup table, skip rather than fail the whole tx
+            let table = solana_sdk::address_lookup_table::state::AddressLookupTable::deserialize(&acc.data)
+                .context("deserialize address lookup table")?;
+            out.push(solana_sdk::address_lookup_table::AddressLookupTableAccount {
+                key: *key,
+                addresses: table.addresses.to_vec(),
+            });
+        }
+        Ok(out)
     }
 
     fn build_arb_ixs(&self, path: &ArbPath) -> Result<Vec<Instruction>> {
